@@ -181,10 +181,16 @@ func showMergeDialog(sourceID int64, sourceName string, onDone func()) {
 								fmt.Sprintf("已搬移 %d 条消息、%d 条画像历史。", result.MovedMessages, result.MovedHistory),
 								walk.MsgBoxIconInformation)
 
-							// 异步重新生成画像
+							// 异步重新生成画像（合并后没有"本次复制"语境，用目标联系人全部消息）
 							if opts.RegenerateProfile {
 								go func() {
-									_ = GenerateOrUpdateProfile(db, llmClient, target.ID, displayName)
+									msgs, err := GetAllMessages(db, target.ID)
+									if err != nil || len(msgs) == 0 {
+										return
+									}
+									if err := GenerateOrUpdateProfile(db, llmClient, target.ID, displayName, msgs); err != nil {
+										_ = saveProfileHistory(db, target.ID, "{}", "画像生成失败: "+err.Error())
+									}
 								}()
 							}
 
@@ -220,4 +226,109 @@ func showMergeDialog(sourceID int64, sourceName string, onDone func()) {
 func getContactTotal(contactID int64) int64 {
 	stats, _ := GetContactStats(db, contactID)
 	return stats.Total
+}
+
+// mergeLogModel 合并记录列表模型
+type mergeLogModel struct {
+	walk.ListModelBase
+	items []MergeLogEntry
+}
+
+func (m *mergeLogModel) ItemCount() int { return len(m.items) }
+
+func (m *mergeLogModel) Value(index int) interface{} {
+	e := m.items[index]
+	return fmt.Sprintf("%s  «%s» 并入（%s）", displayTime(e.CreatedAt), e.SourceName, e.TargetName)
+}
+
+// showMergeHistoryDialog 显示当前联系人的合并记录，支持撤销（拆分）
+func showMergeHistoryDialog(targetContact Contact, onDone func()) {
+	var dlg *walk.Dialog
+	var logLB *walk.ListBox
+	var undoBtn *walk.PushButton
+
+	logs, err := GetMergeLogsForTarget(db, targetContact.ID)
+	if err != nil {
+		showError("读取合并记录失败: " + err.Error())
+		return
+	}
+	if len(logs) == 0 {
+		walk.MsgBox(mainWindow, "合并记录",
+			fmt.Sprintf("「%s」没有已合并进来的昵称。", targetContact.Name),
+			walk.MsgBoxIconInformation)
+		return
+	}
+
+	lm := &mergeLogModel{items: logs}
+
+	if err := (dl.Dialog{
+		AssignTo: &dlg,
+		Title:    fmt.Sprintf("合并记录 - %s", targetContact.Name),
+		MinSize:  dl.Size{Width: 460, Height: 320},
+		Layout:   dl.VBox{Spacing: 8},
+		Children: []dl.Widget{
+			dl.Label{
+				Text: "以下昵称已合并到该联系人。选中一条点「撤销合并」可将其消息与画像历史拆分回去。",
+				Font: fontHint,
+			},
+			dl.ListBox{
+				AssignTo: &logLB,
+				Model:    lm,
+				MinSize:  dl.Size{Width: 420, Height: 140},
+			},
+			dl.Composite{
+				Layout: dl.HBox{MarginsZero: true},
+				Children: []dl.Widget{
+					dl.HSpacer{},
+					dl.PushButton{
+						AssignTo: &undoBtn,
+						Text:     "撤销合并",
+						MinSize:  dl.Size{Width: 100, Height: 32},
+						OnClicked: func() {
+							idx := logLB.CurrentIndex()
+							if idx < 0 || idx >= len(lm.items) {
+								return
+							}
+							entry := lm.items[idx]
+							if walk.MsgBox(dlg, "确认撤销",
+								fmt.Sprintf("确认把「%s」从「%s」中拆分出来？\n该联系人的消息与画像历史将搬回原联系人。",
+									entry.SourceName, entry.TargetName),
+								walk.MsgBoxYesNo|walk.MsgBoxIconQuestion) != walk.DlgCmdYes {
+								return
+							}
+							if err := UndoMerge(db, entry.ID); err != nil {
+								showError("撤销失败: " + err.Error())
+								return
+							}
+							walk.MsgBox(dlg, "已撤销", "合并已撤销，数据已搬回原联系人。", walk.MsgBoxIconInformation)
+							// 刷新列表
+							newLogs, err := GetMergeLogsForTarget(db, targetContact.ID)
+							if err != nil {
+								showError("刷新合并记录失败: " + err.Error())
+								return
+							}
+							lm.items = newLogs
+							lm.PublishItemsReset()
+							if len(newLogs) == 0 {
+								dlg.Accept()
+							}
+							if onDone != nil {
+								onDone()
+							}
+						},
+					},
+					dl.PushButton{
+						Text:      "关闭",
+						MinSize:   dl.Size{Width: 80, Height: 32},
+						OnClicked: func() { dlg.Accept() },
+					},
+				},
+			},
+		},
+	}).Create(mainWindow); err != nil {
+		showError("创建合并记录对话框失败: " + err.Error())
+		return
+	}
+	setTopMost(dlg.Handle())
+	dlg.Run()
 }

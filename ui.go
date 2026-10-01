@@ -258,7 +258,17 @@ func onIdentifyClicked() {
 			return
 		}
 
-		// 5. 取对方最后一条消息做意图分析
+		// 5. 画像生成/更新与意图分析并行：画像异步后台跑，不拖慢结果弹出。
+		//    首次识别时本次分析用的是旧画像（或暂无画像），画像就绪后下次识别生效。
+		if ShouldGenerateProfile(db, contactID) || ShouldUpdateProfile(db, contactID) {
+			go func() {
+				if err := GenerateOrUpdateProfile(db, llmClient, contactID, contactName, messages); err != nil {
+					_ = saveProfileHistory(db, contactID, "{}", "画像生成失败: "+err.Error())
+				}
+			}()
+		}
+
+		// 6. 取对方最后一条消息做意图分析（本次复制的消息）
 		latestOther := ""
 		for i := len(messages) - 1; i >= 0; i-- {
 			if messages[i].Sender == "other" {
@@ -270,17 +280,10 @@ func onIdentifyClicked() {
 			latestOther = messages[len(messages)-1].Content
 		}
 
-		result, analysisErr := AnalyzeIntent(db, llmClient, contactID, latestOther)
+		result, analysisErr := AnalyzeIntent(db, llmClient, contactID, latestOther, messages)
 		mainWindow.Synchronize(func() {
 			ShowResultWindow(contactID, contactName, newCount, viaAlias, result, analysisErr)
 		})
-
-		// 6. 异步生成/更新画像，不阻塞结果展示
-		go func() {
-			if ShouldGenerateProfile(db, contactID) || ShouldUpdateProfile(db, contactID) {
-				_ = GenerateOrUpdateProfile(db, llmClient, contactID, contactName)
-			}
-		}()
 	}()
 }
 
@@ -450,11 +453,17 @@ func ShowResultWindow(contactID int64, contactName string, newCount int, viaAlia
 	}
 	setTopMost(dlg.Handle())
 
-	// 设置置信度进度条
+	// 设置置信度进度条（模型常返回 0~1 小数，如 0.85，转成百分比）
 	if confidencePB != nil {
 		confidenceStr := fieldString(result, "confidence")
+		var f float64
 		confidenceVal := 0
-		fmt.Sscanf(confidenceStr, "%d", &confidenceVal)
+		if _, err := fmt.Sscanf(confidenceStr, "%g", &f); err == nil {
+			if f <= 1.0 {
+				f *= 100
+			}
+			confidenceVal = int(f + 0.5)
+		}
 		if confidenceVal < 0 {
 			confidenceVal = 0
 		}
@@ -462,6 +471,9 @@ func ShowResultWindow(contactID int64, contactName string, newCount int, viaAlia
 			confidenceVal = 100
 		}
 		confidencePB.SetValue(confidenceVal)
+		if confidenceLabel != nil && confidenceVal > 0 {
+			confidenceLabel.SetText(fmt.Sprintf("%d%%", confidenceVal))
+		}
 	}
 	dlg.Run()
 }
@@ -487,7 +499,14 @@ func (m *contactTableModel) Value(row, col int) interface{} {
 	case 1:
 		return c.OtherMsgCount
 	case 2:
-		return c.LastUpdated
+		// 合并状态：被吸收 / 吸收过别人
+		if c.MergedInto != 0 {
+			return "已并入"
+		}
+		if c.MergeCount > 0 {
+			return fmt.Sprintf("含%d人", c.MergeCount)
+		}
+		return ""
 	}
 	return nil
 }
@@ -539,7 +558,12 @@ func (m *historyListModel) Value(index int) interface{} {
 		return nil
 	}
 	h := m.items[index]
-	return fmt.Sprintf("[%s] %s", h.CreatedAt, h.ChangeSummary)
+	summary := h.ChangeSummary
+	// 列表只显示一行，超长的截断显示，完整内容在详情面板里看
+	if r := []rune(summary); len(r) > 40 {
+		summary = string(r[:40]) + "…"
+	}
+	return fmt.Sprintf("[%s] %s", h.CreatedAt, summary)
 }
 
 func (m *historyListModel) set(items []ProfileHistory) { m.items = items }
@@ -686,9 +710,9 @@ func ShowProfileWindow(targetContactID int64) {
 		statTotalVal.SetText(fmt.Sprintf("%d 条", stats.Total))
 		statMineVal.SetText(fmt.Sprintf("%d 条", stats.Mine))
 		statOtherVal.SetText(fmt.Sprintf("%d 条", stats.Other))
-		statFirstVal.SetText(orUnknown(stats.FirstTime))
-		statLastVal.SetText(orUnknown(stats.LastTime))
-		statProfileVal.SetText(orUnknown(contact.LastUpdated))
+		statFirstVal.SetText(orUnknown(displayTime(stats.FirstTime)))
+		statLastVal.SetText(orUnknown(displayTime(stats.LastTime)))
+		statProfileVal.SetText(orUnknown(displayTime(contact.LastUpdated)))
 		statAliasVal.SetText(aliasStr)
 	}
 
@@ -726,65 +750,89 @@ func ShowProfileWindow(targetContactID int64) {
 								Columns: []dl.TableViewColumn{
 									{Title: "昵称", Width: 110},
 									{Title: "对方消息", Width: 55},
+									{Title: "合并", Width: 45},
 								},
 							},
 							dl.Composite{
-								Layout: dl.HBox{MarginsZero: true, Spacing: 4},
+								Layout: dl.VBox{MarginsZero: true, Spacing: 2},
 								Children: []dl.Widget{
-									dl.PushButton{
-										Text:    "补充画像…",
-										MinSize: dl.Size{Width: 80, Height: 28},
-										OnClicked: func() {
-											idx := contactsTV.CurrentIndex()
-											if idx < 0 || idx >= len(cm.items) {
-												return
-											}
-											showSupplementDialog(cm.items[idx], func() {
-												refreshContacts()
-												loadContact(currentID)
-											})
-										},
-									},
-									dl.PushButton{
-										Text:    "改备注…",
-										MinSize: dl.Size{Width: 70, Height: 28},
-										OnClicked: func() {
-											idx := contactsTV.CurrentIndex()
-											if idx < 0 || idx >= len(cm.items) {
-												return
-											}
-											showRemarkDialog(cm.items[idx], func() {
-												refreshContacts()
-												loadContact(currentID)
-											})
-										},
-									},
-									dl.PushButton{
-										AssignTo: &mergeBtn,
-										Text:     "关联昵称…",
-										MinSize:  dl.Size{Width: 100, Height: 28},
-										OnClicked: func() {
-											idx := contactsTV.CurrentIndex()
-											if idx < 0 || idx >= len(cm.items) {
-												return
-											}
-											source := cm.items[idx]
-											showMergeDialog(source.ID, source.Name, func() {
-												refreshContacts()
-												for i, c := range cm.items {
-													if c.ID == currentID {
-														contactsTV.SetCurrentIndex(i)
-														break
+									dl.Composite{
+										Layout: dl.HBox{MarginsZero: true, Spacing: 4},
+										Children: []dl.Widget{
+											dl.PushButton{
+												Text:    "补充画像…",
+												MinSize: dl.Size{Width: 70, Height: 28},
+												OnClicked: func() {
+													idx := contactsTV.CurrentIndex()
+													if idx < 0 || idx >= len(cm.items) {
+														return
 													}
-												}
-											})
+													showSupplementDialog(cm.items[idx], func() {
+														refreshContacts()
+														loadContact(currentID)
+													})
+												},
+											},
+											dl.PushButton{
+												Text:    "改备注…",
+												MinSize: dl.Size{Width: 60, Height: 28},
+												OnClicked: func() {
+													idx := contactsTV.CurrentIndex()
+													if idx < 0 || idx >= len(cm.items) {
+														return
+													}
+													showRemarkDialog(cm.items[idx], func() {
+														refreshContacts()
+														loadContact(currentID)
+													})
+												},
+											},
 										},
 									},
-									dl.CheckBox{
-										AssignTo: &showMergedChk,
-										Text:     "显示已合并",
-										OnClicked: func() {
-											refreshContacts()
+									dl.Composite{
+										Layout: dl.HBox{MarginsZero: true, Spacing: 4},
+										Children: []dl.Widget{
+											dl.PushButton{
+												AssignTo: &mergeBtn,
+												Text:     "关联昵称…",
+												MinSize:  dl.Size{Width: 70, Height: 28},
+												OnClicked: func() {
+													idx := contactsTV.CurrentIndex()
+													if idx < 0 || idx >= len(cm.items) {
+														return
+													}
+													source := cm.items[idx]
+													showMergeDialog(source.ID, source.Name, func() {
+														refreshContacts()
+														for i, c := range cm.items {
+															if c.ID == currentID {
+																contactsTV.SetCurrentIndex(i)
+																break
+															}
+														}
+													})
+												},
+											},
+											dl.PushButton{
+												Text:    "合并记录…",
+												MinSize: dl.Size{Width: 70, Height: 28},
+												OnClicked: func() {
+													idx := contactsTV.CurrentIndex()
+													if idx < 0 || idx >= len(cm.items) {
+														return
+													}
+													showMergeHistoryDialog(cm.items[idx], func() {
+														refreshContacts()
+													})
+												},
+											},
+											dl.CheckBox{
+												AssignTo: &showMergedChk,
+												Text:     "显示已合并",
+												OnClicked: func() {
+													refreshContacts()
+												},
+											},
 										},
 									},
 								},
@@ -1025,13 +1073,13 @@ func profileFullText(p *Profile) string {
 	return b.String()
 }
 
-// statRow 统计页的一行：左标签右值
+// statRow 统计页的一行：左标签固定宽 + 右值固定宽，确保多行左对齐
 func statRow(label string, assignTo **walk.Label) dl.Composite {
 	return dl.Composite{
 		Layout: dl.HBox{MarginsZero: true, Spacing: 4},
 		Children: []dl.Widget{
 			dl.Label{Text: label + "：", Font: fontSection, MinSize: dl.Size{Width: 110}},
-			dl.Label{AssignTo: assignTo, Text: "-", Font: fontBody},
+			dl.Label{AssignTo: assignTo, Text: "-", Font: fontBody, MinSize: dl.Size{Width: 80}, TextAlignment: dl.AlignNear},
 		},
 	}
 }

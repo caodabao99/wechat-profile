@@ -4,14 +4,43 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
+	"time"
 )
+
+// ImportantDates 重要日子列表。模型可能返回 []string，也可能返回 map（如 {"生日":"5月20日"}），
+// 自定义 Unmarshal 统一转成 "key: value" 字符串数组。
+type ImportantDates []string
+
+func (d *ImportantDates) UnmarshalJSON(data []byte) error {
+	var arr []string
+	if err := json.Unmarshal(data, &arr); err == nil {
+		*d = arr
+		return nil
+	}
+	var m map[string]string
+	if err := json.Unmarshal(data, &m); err == nil {
+		keys := make([]string, 0, len(m))
+		for k := range m {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			*d = append(*d, k+": "+m[k])
+		}
+		return nil
+	}
+	// 实在解析不了就置空，避免整个画像解析失败
+	*d = nil
+	return nil
+}
 
 // BasicInfo 基本信息
 type BasicInfo struct {
-	Occupation     string   `json:"occupation"`      // 职业
-	Location       string   `json:"location"`        // 所在城市/地区
-	ImportantDates []string `json:"important_dates"` // 重要日子（生日、纪念日等）
+	Occupation     string         `json:"occupation"`      // 职业
+	Location       string         `json:"location"`        // 所在城市/地区
+	ImportantDates ImportantDates `json:"important_dates"` // 重要日子（生日、纪念日等）
 }
 
 // CommunicationStyle 沟通风格
@@ -50,23 +79,23 @@ type Profile struct {
 	Summary            string             `json:"summary"`         // 100 字内核心概括
 }
 
-// getContactProfileFields 读取联系人的画像字段
-func getContactProfileFields(db *sql.DB, contactID int64) (otherCount int, profileJSON string, err error) {
+// getContactProfileFields 读取联系人的画像字段（含上次生成画像时的对方消息数）
+func getContactProfileFields(db *sql.DB, contactID int64) (otherCount int, profileJSON string, profileMsgCount int, err error) {
 	dbMu.Lock()
 	defer dbMu.Unlock()
 	var pj sql.NullString
 	err = db.QueryRow(
-		`SELECT other_msg_count, COALESCE(profile_json, '') FROM contacts WHERE id = ?`,
-		contactID).Scan(&otherCount, &pj)
+		`SELECT other_msg_count, COALESCE(profile_json, ''), COALESCE(profile_msg_count, 0) FROM contacts WHERE id = ?`,
+		contactID).Scan(&otherCount, &pj, &profileMsgCount)
 	if err != nil {
-		return 0, "", err
+		return 0, "", 0, err
 	}
-	return otherCount, pj.String, nil
+	return otherCount, pj.String, profileMsgCount, nil
 }
 
 // ShouldGenerateProfile 是否到了首次生成画像的时机
 func ShouldGenerateProfile(db *sql.DB, contactID int64) bool {
-	count, pj, err := getContactProfileFields(db, contactID)
+	count, pj, _, err := getContactProfileFields(db, contactID)
 	if err != nil {
 		return false
 	}
@@ -74,9 +103,10 @@ func ShouldGenerateProfile(db *sql.DB, contactID int64) bool {
 	return count >= config.Profile.ColdStartCount && (pj == "" || pj == "{}")
 }
 
-// ShouldUpdateProfile 是否到了周期性更新画像的时机
+// ShouldUpdateProfile 是否到了周期性更新画像的时机：
+// 距离上次生成画像，对方消息新增达到 updateInterval 条即触发（不再用整除判断，避免跳点漏更新）
 func ShouldUpdateProfile(db *sql.DB, contactID int64) bool {
-	count, pj, err := getContactProfileFields(db, contactID)
+	count, pj, lastCount, err := getContactProfileFields(db, contactID)
 	if err != nil {
 		return false
 	}
@@ -85,7 +115,7 @@ func ShouldUpdateProfile(db *sql.DB, contactID int64) bool {
 	if interval <= 0 {
 		return false
 	}
-	return count >= config.Profile.ColdStartCount && pj != "" && pj != "{}" && count%interval == 0
+	return count >= config.Profile.ColdStartCount && pj != "" && pj != "{}" && count-lastCount >= interval
 }
 
 // formatMessagesForPrompt 把消息列表拼成给模型看的对话文本
@@ -105,8 +135,9 @@ func formatMessagesForPrompt(messages []Message) string {
 	return b.String()
 }
 
-// GenerateOrUpdateProfile 生成或更新联系人画像，并写入历史
-func GenerateOrUpdateProfile(db *sql.DB, llmClient *LLMClient, contactID int64, contactName string) error {
+// GenerateOrUpdateProfile 生成或更新联系人画像，并写入历史。
+// messages 为本次用于生成画像的聊天记录（通常是本次复制的消息；合并重生成时为该联系人全部消息）。
+func GenerateOrUpdateProfile(db *sql.DB, llmClient *LLMClient, contactID int64, contactName string, messages []Message) error {
 	// 防护：如果联系人已被合并，重定向到目标联系人
 	merged, targetID, err := IsMerged(db, contactID)
 	if err != nil {
@@ -130,10 +161,8 @@ func GenerateOrUpdateProfile(db *sql.DB, llmClient *LLMClient, contactID int64, 
 	if oldJSON == "" {
 		oldJSON = "{}"
 	}
-
-	messages, err := GetRecentMessages(db, contactID, 50)
-	if err != nil {
-		return fmt.Errorf("读取聊天记录失败: %w", err)
+	if len(messages) == 0 {
+		return fmt.Errorf("没有可用于生成画像的聊天记录")
 	}
 
 	prompt := fmt.Sprintf(`你是人物画像分析助手。请根据【旧画像】和【新增聊天记录】，更新该联系人的人物画像。
@@ -141,7 +170,8 @@ func GenerateOrUpdateProfile(db *sql.DB, llmClient *LLMClient, contactID int64, 
 1. 只基于聊天记录中的证据，不要编造。
 2. 如果新信息与旧画像冲突，以新信息为准。
 3. 输出完整 JSON，结构同旧画像。
-4. summary 字段用 100 字以内概括这个人的核心特征。
+4. intent_patterns 的键（意图名称）必须用中文，如"分享资源"、"技术支持"、"闲聊问候"。
+5. summary 字段用 100 字以内概括这个人的核心特征。
 
 画像 JSON 结构如下：
 {
@@ -151,7 +181,7 @@ func GenerateOrUpdateProfile(db *sql.DB, llmClient *LLMClient, contactID int64, 
   "interests": [],
   "emotional_patterns": {"stressors": [], "comfort_topics": [], "when_upset": ""},
   "relationship": {"closeness": "", "recent_events": [], "interaction_pattern": ""},
-  "intent_patterns": {},
+  "intent_patterns": {"中文意图名称": "描述该意图的典型表现"},
   "important_facts": [],
   "summary": ""
 }
@@ -226,8 +256,9 @@ func SupplementProfile(db *sql.DB, llmClient *LLMClient, contactID int64, contac
 要求：
 1. 用户手动提供的信息是准确的第一手资料，优先级最高，直接更新到画像对应字段。
 2. 不要删除原有画像中没有被新信息覆盖的内容。
-3. 输出完整 JSON，结构同旧画像。
-4. summary 字段用 100 字以内概括这个人的核心特征。
+3. 日期类信息（如生日、纪念日）严格按照用户提供的精度记录：提供了年月日就记年月日，只提供月日就只记月日，不要自行补全或猜测缺失的部分。
+4. 输出完整 JSON，结构同旧画像。
+5. summary 字段用 100 字以内概括这个人的核心特征。
 
 联系人：%s
 【旧画像】
@@ -252,10 +283,8 @@ func SupplementProfile(db *sql.DB, llmClient *LLMClient, contactID int64, contac
 	}
 	newJSON := string(newJSONBytes)
 
+	// 完整记录用户补充的内容，不做截断（列表显示时再截断）
 	changeSummary := "手动补充: " + strings.TrimSpace(userNote)
-	if r := []rune(changeSummary); len(r) > 60 {
-		changeSummary = string(r[:60]) + "..."
-	}
 
 	if err := SaveProfile(db, contactID, newJSON, profile.Summary, changeSummary); err != nil {
 		return fmt.Errorf("保存画像失败: %w", err)
@@ -263,8 +292,9 @@ func SupplementProfile(db *sql.DB, llmClient *LLMClient, contactID int64, contac
 	return nil
 }
 
-// AnalyzeIntent 结合画像与近期对话分析对方最新消息的意图
-func AnalyzeIntent(db *sql.DB, llmClient *LLMClient, contactID int64, newMessage string) (map[string]interface{}, error) {
+// AnalyzeIntent 结合画像与本次复制的对话，分析对方最新消息的意图。
+// messages 为本次多选复制解析出的消息（不限条数），不按历史累计加载。
+func AnalyzeIntent(db *sql.DB, llmClient *LLMClient, contactID int64, newMessage string, messages []Message) (map[string]interface{}, error) {
 	contact, err := GetContactByID(db, contactID)
 	if err != nil {
 		return nil, fmt.Errorf("读取联系人失败: %w", err)
@@ -274,19 +304,10 @@ func AnalyzeIntent(db *sql.DB, llmClient *LLMClient, contactID int64, newMessage
 		profileSummary = "（暂无画像，消息积累到一定数量后会自动生成）"
 	}
 
-	limit := config.Context.RecentMessageCount
-	if limit <= 0 {
-		limit = 30
-	}
-	messages, err := GetRecentMessages(db, contactID, limit)
-	if err != nil {
-		return nil, fmt.Errorf("读取近期对话失败: %w", err)
-	}
-
-	prompt := fmt.Sprintf(`你是聊天分析助手。下面是联系人的人物画像和近期对话，请分析对方最新消息的意图。
+	prompt := fmt.Sprintf(`你是聊天分析助手。下面是联系人的人物画像和本次对话，请分析对方最新消息的意图。
 【人物画像】
 %s
-【近期对话】
+【本次对话】
 %s
 【当前对方最新消息】
 对方：%s
@@ -318,6 +339,25 @@ func AnalyzeIntent(db *sql.DB, llmClient *LLMClient, contactID int64, newMessage
 func orUnknown(s string) string {
 	if strings.TrimSpace(s) == "" {
 		return "暂无"
+	}
+	return s
+}
+
+// displayTime 把数据库里的时间字符串统一成可读的本地时间显示。
+// 数据库时间列统一存 RFC3339（如 2026-10-01T14:45:54+08:00），驱动读出转 UTC 后
+// 用 time.Parse + Local() 还原成本地时间；纯文本日期则直接按本地时区解析。
+func displayTime(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	// 标准 RFC3339（含 Z 或 +08:00）→ 正确解析后转本地
+	if t, err := time.Parse(time.RFC3339, s); err == nil {
+		return t.Local().Format("2006-01-02 15:04:05")
+	}
+	// 纯文本日期（如 2026-10-01 14:45:54）→ 直接按本地时区解析
+	if t, err := time.ParseInLocation("2006-01-02 15:04:05", s, time.Local); err == nil {
+		return t.Format("2006-01-02 15:04:05")
 	}
 	return s
 }

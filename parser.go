@@ -68,7 +68,9 @@ func parseTime(s string) time.Time {
 	s = regexp.MustCompile(`[ \t]+`).ReplaceAllString(s, " ")
 
 	for _, layout := range timeLayouts {
-		if ts, err := time.Parse(layout, s); err == nil {
+		// 微信文本里的时间就是本地时间，必须按本地时区解析，
+		// 否则 time.Parse 会按 UTC 处理，显示时再转本地会差 8 小时
+		if ts, err := time.ParseInLocation(layout, s, time.Local); err == nil {
 			return ts
 		}
 	}

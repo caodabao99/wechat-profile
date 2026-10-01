@@ -3,6 +3,7 @@ package main
 import (
 	"database/sql"
 	"strings"
+	"time"
 )
 
 // Contact 对应 contacts 表的一行
@@ -16,6 +17,7 @@ type Contact struct {
 	LastUpdated    string
 	CreatedAt      string
 	MergedInto     int64    // 已合并到的目标联系人 id，0 表示未合并
+	MergeCount     int      // 作为目标吸收过多少个联系人（未撤销的合并数）
 	Aliases        []string // 已确认的历史昵称列表（按需加载）
 }
 
@@ -64,7 +66,8 @@ func GetOrCreateContact(db *sql.DB, name string) (int64, error) {
 		return 0, err
 	}
 
-	res, err := db.Exec(`INSERT INTO contacts (name) VALUES (?)`, name)
+	res, err := db.Exec(`INSERT INTO contacts (name, created_at) VALUES (?, ?)`, name,
+		time.Now().Format(time.RFC3339))
 	if err != nil {
 		return 0, err
 	}
@@ -123,7 +126,8 @@ func ResolveContactID(db *sql.DB, name string) (int64, bool, error) {
 	}
 
 	// 3. 新建
-	res, err := db.Exec(`INSERT INTO contacts (name) VALUES (?)`, name)
+	res, err := db.Exec(`INSERT INTO contacts (name, created_at) VALUES (?, ?)`, name,
+		time.Now().Format(time.RFC3339))
 	if err != nil {
 		return 0, false, err
 	}

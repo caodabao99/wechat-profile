@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 )
 
 // MergeOptions 合并选项
@@ -127,8 +128,8 @@ func MergeContacts(db *sql.DB, sourceID, targetID int64, opts MergeOptions) (Mer
 			return result, err
 		}
 		if sourceProfileJSON != "" && sourceProfileJSON != "{}" {
-			if _, err := tx.Exec(`UPDATE contacts SET profile_json = ?, profile_summary = ?, last_updated = CURRENT_TIMESTAMP WHERE id = ?`,
-				sourceProfileJSON, sourceProfileSummary, targetID); err != nil {
+			if _, err := tx.Exec(`UPDATE contacts SET profile_json = ?, profile_summary = ?, last_updated = ? WHERE id = ?`,
+				sourceProfileJSON, sourceProfileSummary, time.Now().Format(time.RFC3339), targetID); err != nil {
 				return result, err
 			}
 		}
@@ -167,9 +168,9 @@ func MergeContacts(db *sql.DB, sourceID, targetID int64, opts MergeOptions) (Mer
 		if alias == "" {
 			continue
 		}
-		if _, err := tx.Exec(`INSERT INTO contact_aliases (contact_id, alias) VALUES (?, ?)
+		if _, err := tx.Exec(`INSERT INTO contact_aliases (contact_id, alias, created_at) VALUES (?, ?, ?)
 			ON CONFLICT(alias) DO UPDATE SET contact_id = excluded.contact_id`,
-			targetID, alias); err != nil {
+			targetID, alias, time.Now().Format(time.RFC3339)); err != nil {
 			return result, err
 		}
 	}
@@ -182,17 +183,31 @@ func MergeContacts(db *sql.DB, sourceID, targetID int64, opts MergeOptions) (Mer
 	// 10. 写 merge_log
 	msgIDsJSON, _ := json.Marshal(msgIDs)
 	historyIDsJSON, _ := json.Marshal(historyIDs)
-	res, err = tx.Exec(`INSERT INTO merge_log (source_id, target_id, source_name, target_name, moved_message_ids, moved_history_ids)
-		VALUES (?, ?, ?, ?, ?, ?)`,
-		sourceID, targetID, sourceName, targetName, string(msgIDsJSON), string(historyIDsJSON))
+	res, err = tx.Exec(`INSERT INTO merge_log (source_id, target_id, source_name, target_name, moved_message_ids, moved_history_ids, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		sourceID, targetID, sourceName, targetName, string(msgIDsJSON), string(historyIDsJSON),
+		time.Now().Format(time.RFC3339))
 	if err != nil {
 		return result, err
 	}
 	result.MergeLogID, _ = res.LastInsertId()
 
+	// 11. 合并事件写入目标的画像历史（必须在事务内写——saveProfileHistory 会再加 dbMu 锁，
+	// 而本函数持有锁未释放，事务外调用会死锁，表现为点击确认后程序卡死）
+	summary := fmt.Sprintf("合并联系人「%s」：搬移 %d 条消息、%d 条画像历史",
+		sourceName, result.MovedMessages, result.MovedHistory)
+	if opts.RegenerateProfile {
+		summary += "，并重新生成画像"
+	}
+	if _, err := tx.Exec(`INSERT INTO profile_history (contact_id, profile_json, change_summary, created_at)
+		VALUES (?, ?, ?, ?)`, targetID, "{}", summary, time.Now().Format(time.RFC3339)); err != nil {
+		return result, err
+	}
+
 	if err := tx.Commit(); err != nil {
 		return result, err
 	}
+
 	return result, nil
 }
 
@@ -293,7 +308,11 @@ func UndoMerge(db *sql.DB, mergeLogID int64) error {
 		}
 	}
 
-	// 4. 恢复 source 的名字（如果之前被改过）
+	// 4. 恢复双方名字（合并时若选了用新昵称显示，target 被改成了 source 的名字，
+	// 必须先把 target 改回它自己的原名，否则恢复 source 名字会撞 UNIQUE）
+	if _, err := tx.Exec(`UPDATE contacts SET name = ? WHERE id = ?`, log.TargetName, log.TargetID); err != nil {
+		return err
+	}
 	if _, err := tx.Exec(`UPDATE contacts SET name = ? WHERE id = ?`, log.SourceName, log.SourceID); err != nil {
 		return err
 	}
@@ -307,12 +326,28 @@ func UndoMerge(db *sql.DB, mergeLogID int64) error {
 		}
 	}
 
-	// 6. 标记撤销时间
-	if _, err := tx.Exec(`UPDATE merge_log SET undone_at = CURRENT_TIMESTAMP WHERE id = ?`, mergeLogID); err != nil {
+	// 6. 标记撤销时间（本地时间，不用 CURRENT_TIMESTAMP）
+	if _, err := tx.Exec(`UPDATE merge_log SET undone_at = ? WHERE id = ?`,
+		time.Now().Format(time.RFC3339), mergeLogID); err != nil {
 		return err
 	}
 
-	return tx.Commit()
+	// 7. 撤销事件写入双方的画像历史（必须在事务内——saveProfileHistory 会再加 dbMu 锁，
+	// 本函数持锁未释放时调用会死锁）
+	summary := fmt.Sprintf("撤销合并「%s」：消息与画像历史已搬回", log.SourceName)
+	now := time.Now().Format(time.RFC3339)
+	for _, cid := range []int64{log.SourceID, log.TargetID} {
+		if _, err := tx.Exec(`INSERT INTO profile_history (contact_id, profile_json, change_summary, created_at)
+			VALUES (?, ?, ?, ?)`, cid, "{}", summary, now); err != nil {
+			return err
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 // GetAliases 获取联系人的已确认别名列表
@@ -375,6 +410,33 @@ type MergeLogEntry struct {
 	TargetName string
 	CreatedAt  string
 	UndoneAt   string
+}
+
+// GetMergeLogsForTarget 查询指定联系人作为 target 且未撤销的合并记录
+func GetMergeLogsForTarget(db *sql.DB, targetID int64) ([]MergeLogEntry, error) {
+	dbMu.Lock()
+	defer dbMu.Unlock()
+
+	rows, err := db.Query(
+		`SELECT id, source_id, target_id, source_name, target_name, created_at, undone_at
+		 FROM merge_log WHERE target_id = ? AND undone_at IS NULL ORDER BY id DESC`,
+		targetID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []MergeLogEntry
+	for rows.Next() {
+		var e MergeLogEntry
+		var undoneAt sql.NullString
+		if err := rows.Scan(&e.ID, &e.SourceID, &e.TargetID, &e.SourceName, &e.TargetName, &e.CreatedAt, &undoneAt); err != nil {
+			return nil, err
+		}
+		e.UndoneAt = undoneAt.String
+		out = append(out, e)
+	}
+	return out, rows.Err()
 }
 
 // IsMerged 检查联系人是否已被合并
