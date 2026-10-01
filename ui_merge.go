@@ -1,0 +1,223 @@
+package main
+
+import (
+	"fmt"
+	"strings"
+
+	"github.com/lxn/walk"
+	dl "github.com/lxn/walk/declarative"
+)
+
+// mergeTargetModel 合并对话框目标联系人列表模型
+// 注意：walk 的 ListBox 模型方法只能定义在包级类型上，局部类型无法定义方法会导致反射建型失败
+type mergeTargetModel struct {
+	walk.ListModelBase
+	items []Contact
+}
+
+func (m *mergeTargetModel) ItemCount() int { return len(m.items) }
+
+func (m *mergeTargetModel) Value(index int) interface{} {
+	if index < 0 || index >= len(m.items) {
+		return nil
+	}
+	return m.items[index].Name
+}
+
+// showMergeDialog 显示合并联系人对话框
+// sourceID: 要合并掉的联系人（新昵称）
+// sourceName: 源联系人昵称
+// onDone: 合并完成后的回调（刷新列表等）
+func showMergeDialog(sourceID int64, sourceName string, onDone func()) {
+	var dlg *walk.Dialog
+	var targetLE *walk.LineEdit
+	var targetLB *walk.ListBox
+	var previewLabel *walk.Label
+	var keepTargetRB, useSourceRB *walk.RadioButton
+	var regenChk *walk.CheckBox
+	var confirmBtn *walk.PushButton
+
+	candidates, err := GetMergeCandidates(db, sourceID)
+	if err != nil {
+		showError("读取候选联系人失败: " + err.Error())
+		return
+	}
+	if len(candidates) == 0 {
+		showError("没有可合并的目标联系人")
+		return
+	}
+
+	// 过滤后的候选列表
+	var filtered []Contact
+	filtered = candidates
+
+	tm := &mergeTargetModel{items: filtered}
+
+	// 更新预览
+	updatePreview := func() {
+		idx := targetLB.CurrentIndex()
+		if idx < 0 || idx >= len(tm.items) {
+			previewLabel.SetText("请选择目标联系人")
+			confirmBtn.SetEnabled(false)
+			return
+		}
+		target := tm.items[idx]
+
+		sourceStats, _ := GetContactStats(db, sourceID)
+		targetStats, _ := GetContactStats(db, target.ID)
+
+		previewLabel.SetText(fmt.Sprintf(
+			"合并后共 %d 条消息（源 %d + 目标 %d，重复消息自动去重）",
+			sourceStats.Total+targetStats.Total, sourceStats.Total, targetStats.Total))
+		confirmBtn.SetEnabled(true)
+
+		// 默认勾选重生成画像（如果目标消息数达到阈值）
+		if target.OtherMsgCount >= config.Profile.ColdStartCount {
+			regenChk.SetChecked(true)
+		}
+	}
+
+	if err := (dl.Dialog{
+		AssignTo: &dlg,
+		Title:    "关联昵称",
+		MinSize:  dl.Size{Width: 480, Height: 420},
+		Layout:   dl.VBox{Spacing: 8},
+		Children: []dl.Widget{
+			dl.Label{
+				Text: fmt.Sprintf("把「%s」的数据合并到下方选择的旧联系人。\n此操作会搬移全部消息与画像历史，可在历史页撤销。", sourceName),
+				Font: fontHint,
+			},
+			dl.Composite{
+				Layout: dl.HBox{MarginsZero: true, Spacing: 8},
+				Children: []dl.Widget{
+					dl.Label{Text: "新昵称（源）:", Font: fontSection},
+					dl.Label{Text: sourceName, Font: fontBody},
+				},
+			},
+			dl.Label{Text: "旧联系人（目标，保留的联系人）:", Font: fontSection},
+			dl.LineEdit{
+				AssignTo:  &targetLE,
+				CueBanner: "搜索目标联系人昵称",
+				OnTextChanged: func() {
+					q := strings.TrimSpace(targetLE.Text())
+					filtered = nil
+					for _, c := range candidates {
+						if q == "" || strings.Contains(c.Name, q) {
+							filtered = append(filtered, c)
+						}
+					}
+					tm.items = filtered
+					tm.PublishItemsReset()
+				},
+			},
+			dl.ListBox{
+				AssignTo: &targetLB,
+				Model:    tm,
+				MinSize:  dl.Size{Width: 400, Height: 120},
+			},
+			dl.Label{AssignTo: &previewLabel, Text: "请选择目标联系人", Font: fontHint},
+			dl.Composite{
+				Layout: dl.VBox{MarginsZero: true, Spacing: 4},
+				Children: []dl.Widget{
+					dl.RadioButton{
+						AssignTo: &useSourceRB,
+						Text:     fmt.Sprintf("用新昵称「%s」作为显示名（推荐）", sourceName),
+					},
+					dl.RadioButton{
+						AssignTo: &keepTargetRB,
+						Text:     "用旧联系人的原昵称作为显示名",
+					},
+				},
+			},
+			dl.CheckBox{
+				AssignTo: &regenChk,
+				Text:     "合并完成后重新生成画像",
+			},
+			dl.Composite{
+				Layout: dl.HBox{MarginsZero: true},
+				Children: []dl.Widget{
+					dl.HSpacer{},
+					dl.PushButton{
+						AssignTo: &confirmBtn,
+						Text:     "确认合并",
+						MinSize:  dl.Size{Width: 100, Height: 32},
+						Enabled:  false,
+						OnClicked: func() {
+							idx := targetLB.CurrentIndex()
+							if idx < 0 || idx >= len(tm.items) {
+								return
+							}
+							target := tm.items[idx]
+
+							// 二次确认
+							displayName := target.Name
+							if useSourceRB.Checked() {
+								displayName = sourceName
+							}
+							msg := fmt.Sprintf(
+								"确认把「%s」合并到「%s」？\n\n"+
+									"消息数：源 %d 条 → 目标 %d 条\n"+
+									"最终显示名：%s\n"+
+									"合并后「%s」的历史昵称将自动归位到该联系人。",
+								sourceName, target.Name,
+								getContactTotal(sourceID), getContactTotal(target.ID),
+								displayName, sourceName)
+							if walk.MsgBox(dlg, "确认合并", msg, walk.MsgBoxYesNo|walk.MsgBoxIconQuestion) != walk.DlgCmdYes {
+								return
+							}
+
+							// 执行合并
+							opts := MergeOptions{
+								UseSourceNameAsDisplay: useSourceRB.Checked(),
+								RegenerateProfile:      regenChk.Checked(),
+							}
+							result, err := MergeContacts(db, sourceID, target.ID, opts)
+							if err != nil {
+								showError("合并失败: " + err.Error())
+								return
+							}
+
+							walk.MsgBox(dlg, "合并完成",
+								fmt.Sprintf("已搬移 %d 条消息、%d 条画像历史。", result.MovedMessages, result.MovedHistory),
+								walk.MsgBoxIconInformation)
+
+							// 异步重新生成画像
+							if opts.RegenerateProfile {
+								go func() {
+									_ = GenerateOrUpdateProfile(db, llmClient, target.ID, displayName)
+								}()
+							}
+
+							dlg.Accept()
+							if onDone != nil {
+								onDone()
+							}
+						},
+					},
+					dl.PushButton{
+						Text:      "取消",
+						MinSize:   dl.Size{Width: 80, Height: 32},
+						OnClicked: func() { dlg.Cancel() },
+					},
+				},
+			},
+		},
+	}).Create(mainWindow); err != nil {
+		showError("创建合并对话框失败: " + err.Error())
+		return
+	}
+	setTopMost(dlg.Handle())
+
+	// 选中目标时更新预览
+	targetLB.CurrentIndexChanged().Attach(updatePreview)
+
+	// 默认选中「使用新昵称」
+	useSourceRB.SetChecked(true)
+
+	dlg.Run()
+}
+
+func getContactTotal(contactID int64) int64 {
+	stats, _ := GetContactStats(db, contactID)
+	return stats.Total
+}

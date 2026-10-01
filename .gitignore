@@ -1,0 +1,18 @@
+# 敏感配置（包含 apiKey，勿上传）
+config.json
+
+# 编译产物
+wechat-profile.exe
+wechat-profile
+dist/
+
+# 运行时生成的数据库
+wechat_profile.db
+wechat_profile.db-*
+
+# 调试文件
+clipboard_debug.txt
+
+# 系统文件
+Thumbs.db
+.DS_Store
