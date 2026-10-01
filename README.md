@@ -23,7 +23,7 @@
 
 ### 方式一：直接下载（推荐）
 
-去 [Releases](https://github.com/你的用户名/wechat-profile/releases) 页面下载最新版 `wechat-profile-v1.0.zip`，解压到任意目录。
+去 [Releases](https://github.com/caodabao99/wechat-profile/releases) 页面下载最新版 [wechat-profile-v1.0.zip](https://github.com/caodabao99/wechat-profile/releases/download/v1.0/wechat-profile-v1.0.zip)，解压到任意目录。
 
 ### 方式二：自行编译
 
@@ -123,4 +123,4 @@ go build -ldflags="-H windowsgui" -o wechat-profile.exe
 
 ## 开源协议
 
-[MIT](LICENSE)（如未提供 LICENSE 文件，则默认 MIT）
+[MIT](LICENSE)
