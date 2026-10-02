@@ -25,7 +25,7 @@
 
 ### 方式一：直接下载（推荐）
 
-去 [Releases](https://github.com/caodabao99/wechat-profile/releases) 页面下载最新版 `wechat-profile-v1.1.zip`，解压到任意目录。
+去 [Releases](https://github.com/caodabao99/wechat-profile/releases) 页面下载最新版 `wechat-profile-v2.0.zip`，解压到任意目录。
 
 ### 方式二：自行编译
 
