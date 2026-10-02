@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -105,10 +106,23 @@ func SetupFloatingWindow() error {
 
 	// 定时检查置顶状态，仅在被其他程序顶掉时才重申
 	// （无脑每秒 SetWindowPos 会导致分层窗口闪烁，还会把结果窗/画像窗压到浮窗下面）
+	//
+	// 窗口销毁时必须停下：否则这个 goroutine 会一直往已经退出的消息循环里
+	// Synchronize，操作一个已释放的 HWND。
+	stopTopMost := make(chan struct{})
+	mainWindow.Disposing().Attach(func() { close(stopTopMost) })
 	go func() {
 		ticker := time.NewTicker(time.Second)
 		defer ticker.Stop()
-		for range ticker.C {
+		for {
+			select {
+			case <-stopTopMost:
+				return
+			case <-ticker.C:
+			}
+			if mainWindow.IsDisposed() {
+				return
+			}
 			mainWindow.Synchronize(func() {
 				hwnd := mainWindow.Handle()
 				if win.GetWindowLong(hwnd, win.GWL_EXSTYLE)&win.WS_EX_TOPMOST == 0 {
@@ -215,76 +229,108 @@ func onIdentifyClicked() {
 			return
 		}
 
-		// 2. 解析聊天记录
-		messages := ParseClipboard(text, config.MyName)
-		if len(messages) == 0 {
-			finalStatus = "未解析到消息"
+		if isRemoteMode {
+			onIdentifyRemote(text, &finalStatus)
 			return
 		}
-
-		// 3. 推断联系人
-		contactName := InferContactName(messages, config.MyName)
-		if strings.TrimSpace(contactName) == "" {
-			dumpPath := DumpClipboardForDebug(text)
-			preview := strings.TrimSpace(text)
-			if r := []rune(preview); len(r) > 120 {
-				preview = string(r[:120]) + "..."
-			}
-			mainWindow.Synchronize(func() {
-				showError(fmt.Sprintf(
-					"无法识别对方昵称，可能原因：\n"+
-						"1. 复制的不是带昵称的完整聊天记录；\n"+
-						"2. config.json 中的 myName 未改成你自己的微信昵称。\n\n"+
-						"已把本次剪贴板内容保存到：\n%s\n\n"+
-						"识别到的前 120 字：\n%s\n\n"+
-						"请检查 config.json 的 myName，或把上面的文件发给开发者适配新版格式。",
-					dumpPath, preview))
-			})
-			return
-		}
-
-		// 4. 落库（三级解析：精确匹配→别名→新建）
-		contactID, viaAlias, err := ResolveContactID(db, contactName)
-		if err != nil {
-			mainWindow.Synchronize(func() { showError("写入联系人失败: " + err.Error()) })
-			return
-		}
-		if viaAlias {
-			finalStatus = "旧昵称已归位"
-		}
-		newCount, err := SaveMessages(db, contactID, messages)
-		if err != nil {
-			mainWindow.Synchronize(func() { showError("保存消息失败: " + err.Error()) })
-			return
-		}
-
-		// 5. 画像生成/更新与意图分析并行：画像异步后台跑，不拖慢结果弹出。
-		//    首次识别时本次分析用的是旧画像（或暂无画像），画像就绪后下次识别生效。
-		if ShouldGenerateProfile(db, contactID) || ShouldUpdateProfile(db, contactID) {
-			go func() {
-				if err := GenerateOrUpdateProfile(db, llmClient, contactID, contactName, messages); err != nil {
-					_ = saveProfileHistory(db, contactID, "{}", "画像生成失败: "+err.Error())
-				}
-			}()
-		}
-
-		// 6. 取对方最后一条消息做意图分析（本次复制的消息）
-		latestOther := ""
-		for i := len(messages) - 1; i >= 0; i-- {
-			if messages[i].Sender == "other" {
-				latestOther = messages[i].Content
-				break
-			}
-		}
-		if latestOther == "" {
-			latestOther = messages[len(messages)-1].Content
-		}
-
-		result, analysisErr := AnalyzeIntent(db, llmClient, contactID, latestOther, messages)
-		mainWindow.Synchronize(func() {
-			ShowResultWindow(contactID, contactName, newCount, viaAlias, result, analysisErr)
-		})
+		onIdentifyLocal(text, &finalStatus)
 	}()
+}
+
+// onIdentifyRemote 远程模式：全部交给 bot 服务端处理
+func onIdentifyRemote(text string, finalStatus *string) {
+	result, err := remoteClient.Ingest(text, true)
+	if err != nil {
+		// 网络/服务端问题，重试同样的内容有意义：放开去重，不用再复制一遍
+		ResetClipboardHash()
+		mainWindow.Synchronize(func() { showError("识别失败: " + err.Error()) })
+		return
+	}
+
+	if result.ViaAlias {
+		*finalStatus = "旧昵称已归位"
+	}
+	if result.ProfileTriggered {
+		*finalStatus = "已识别，画像更新中"
+	}
+
+	mainWindow.Synchronize(func() {
+		ShowResultWindowRemote(result)
+	})
+}
+
+// onIdentifyLocal 本地模式：走本地 SQLite + 本地 LLM
+func onIdentifyLocal(text string, finalStatus *string) {
+	// 2. 解析聊天记录
+	messages := ParseClipboard(text, config.MyName)
+	if len(messages) == 0 {
+		*finalStatus = "未解析到消息"
+		return
+	}
+
+	// 3. 推断联系人
+	contactName := InferContactName(messages, config.MyName)
+	if strings.TrimSpace(contactName) == "" {
+		dumpPath := DumpClipboardForDebug(text)
+		preview := strings.TrimSpace(text)
+		if r := []rune(preview); len(r) > 120 {
+			preview = string(r[:120]) + "..."
+		}
+		mainWindow.Synchronize(func() {
+			showError(fmt.Sprintf(
+				"无法识别对方昵称，可能原因：\n"+
+					"1. 复制的不是带昵称的完整聊天记录；\n"+
+					"2. config.json 中的 myName 未改成你自己的微信昵称。\n\n"+
+					"已把本次剪贴板内容保存到：\n%s\n\n"+
+					"识别到的前 120 字：\n%s\n\n"+
+					"请检查 config.json 的 myName，或把上面的文件发给开发者适配新版格式。",
+				dumpPath, preview))
+		})
+		return
+	}
+
+	// 4. 落库（三级解析：精确匹配→别名→新建）
+	contactID, viaAlias, err := doResolveContact(contactName)
+	if err != nil {
+		ResetClipboardHash() // 落库失败（磁盘/网络），重试同样内容有意义
+		mainWindow.Synchronize(func() { showError("写入联系人失败: " + err.Error()) })
+		return
+	}
+	if viaAlias {
+		*finalStatus = "旧昵称已归位"
+	}
+	newCount, err := doSaveMessages(contactID, messages)
+	if err != nil {
+		ResetClipboardHash()
+		mainWindow.Synchronize(func() { showError("保存消息失败: " + err.Error()) })
+		return
+	}
+
+	// 5. 画像生成/更新与意图分析并行：画像异步后台跑，不拖慢结果弹出。
+	if doShouldGenerateProfile(contactID) || doShouldUpdateProfile(contactID) {
+		go func() {
+			if err := doGenerateOrUpdateProfile(contactID, contactName, messages); err != nil {
+				_ = doSaveProfileHistory(contactID, "{}", "画像生成失败: "+err.Error())
+			}
+		}()
+	}
+
+	// 6. 取对方最后一条消息做意图分析（本次复制的消息）
+	latestOther := ""
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Sender == "other" {
+			latestOther = messages[i].Content
+			break
+		}
+	}
+	if latestOther == "" {
+		latestOther = messages[len(messages)-1].Content
+	}
+
+	result, analysisErr := doAnalyzeIntent(contactID, latestOther)
+	mainWindow.Synchronize(func() {
+		ShowResultWindow(contactID, contactName, newCount, viaAlias, result, analysisErr)
+	})
 }
 
 // fieldString 从分析结果 map 中安全取字段
@@ -301,6 +347,36 @@ func fieldString(m map[string]interface{}, key string) string {
 	return "暂无"
 }
 
+// parseConfidence 把模型返回的置信度统一成 0~100 的整数。
+//
+// 模型有时给 0.85，有时给 85，两种都归一成 85；解析不出来返回 -1，
+// 界面显示"暂无"而不是一个误导性的 0%。
+func parseConfidence(raw string) int {
+	var f float64
+	if _, err := fmt.Sscanf(strings.TrimSpace(raw), "%g", &f); err != nil {
+		return -1
+	}
+	if f > 0 && f <= 1.0 {
+		f *= 100
+	}
+	v := int(f + 0.5)
+	if v < 0 {
+		v = 0
+	}
+	if v > 100 {
+		v = 100
+	}
+	return v
+}
+
+// confidenceText 置信度的界面文案
+func confidenceText(v int) string {
+	if v < 0 {
+		return "暂无"
+	}
+	return fmt.Sprintf("%d%%", v)
+}
+
 // ShowResultWindow 弹出意图分析结果窗口（卡片式布局）
 func ShowResultWindow(contactID int64, contactName string, newCount int, viaAlias bool, result map[string]interface{}, analysisErr error) {
 	var dlg *walk.Dialog
@@ -308,6 +384,9 @@ func ShowResultWindow(contactID int64, contactName string, newCount int, viaAlia
 	var suggestionTE *walk.TextEdit
 	var confidencePB *walk.ProgressBar
 	var confidenceLabel *walk.Label
+
+	// -1 表示这次没有置信度可显示（分析失败或模型没给）
+	confidenceVal := -1
 
 	var headerText string
 	if viaAlias {
@@ -402,8 +481,9 @@ func ShowResultWindow(contactID int64, contactName string, newCount int, viaAlia
 			}
 		}
 
-		// 置信度
-		confidenceStr := fieldString(result, "confidence")
+		// 置信度：标签初值就必须是格式化好的百分比，
+		// 否则模型没给置信度时界面上会一直停着原始的 "0.85"。
+		confidenceVal = parseConfidence(fieldString(result, "confidence"))
 		children = append(children,
 			dl.Composite{
 				Layout: dl.HBox{MarginsZero: true, Spacing: 8},
@@ -413,7 +493,7 @@ func ShowResultWindow(contactID int64, contactName string, newCount int, viaAlia
 						AssignTo: &confidencePB,
 						MinSize:  dl.Size{Width: 200, Height: 20},
 					},
-					dl.Label{AssignTo: &confidenceLabel, Text: confidenceStr, Font: fontBody},
+					dl.Label{AssignTo: &confidenceLabel, Text: confidenceText(confidenceVal), Font: fontBody},
 				},
 			},
 		)
@@ -453,26 +533,10 @@ func ShowResultWindow(contactID int64, contactName string, newCount int, viaAlia
 	}
 	setTopMost(dlg.Handle())
 
-	// 设置置信度进度条（模型常返回 0~1 小数，如 0.85，转成百分比）
+	// 进度条只认 0~100；没有置信度时停在 0，文案由 confidenceText 统一显示"暂无"
 	if confidencePB != nil {
-		confidenceStr := fieldString(result, "confidence")
-		var f float64
-		confidenceVal := 0
-		if _, err := fmt.Sscanf(confidenceStr, "%g", &f); err == nil {
-			if f <= 1.0 {
-				f *= 100
-			}
-			confidenceVal = int(f + 0.5)
-		}
-		if confidenceVal < 0 {
-			confidenceVal = 0
-		}
-		if confidenceVal > 100 {
-			confidenceVal = 100
-		}
-		confidencePB.SetValue(confidenceVal)
-		if confidenceLabel != nil && confidenceVal > 0 {
-			confidenceLabel.SetText(fmt.Sprintf("%d%%", confidenceVal))
+		if confidenceVal > 0 {
+			confidencePB.SetValue(confidenceVal)
 		}
 	}
 	dlg.Run()
@@ -563,7 +627,9 @@ func (m *historyListModel) Value(index int) interface{} {
 	if r := []rune(summary); len(r) > 40 {
 		summary = string(r[:40]) + "…"
 	}
-	return fmt.Sprintf("[%s] %s", h.CreatedAt, summary)
+	// CreatedAt 存的是 RFC3339（2026-10-01T14:03:22+08:00），直接拼进列表
+	// 又长又带时区，用 displayTime 统一成 "2026-10-01 14:03:22"
+	return fmt.Sprintf("[%s] %s", orUnknown(displayTime(h.CreatedAt)), summary)
 }
 
 func (m *historyListModel) set(items []ProfileHistory) { m.items = items }
@@ -578,6 +644,21 @@ func formatList(items []string) string {
 		fmt.Fprintf(&b, "- %s\r\n", item)
 	}
 	return b.String()
+}
+
+// matchContact 搜索框的匹配规则：q 必须已经小写化。
+// 昵称、备注、历史昵称（别名）任一命中即算匹配。
+func matchContact(c Contact, q string) bool {
+	if strings.Contains(strings.ToLower(c.Name), q) ||
+		strings.Contains(strings.ToLower(c.Remark), q) {
+		return true
+	}
+	for _, a := range c.Aliases {
+		if strings.Contains(strings.ToLower(a), q) {
+			return true
+		}
+	}
+	return false
 }
 
 // ShowProfileWindow 展示完整画像：左侧联系人，右侧画像/消息/历史/统计
@@ -600,7 +681,7 @@ func ShowProfileWindow(targetContactID int64) {
 	var mergeBtn *walk.PushButton
 	var showMergedChk *walk.CheckBox
 
-	contacts, err := GetAllContacts(db, false)
+	contacts, err := fetchContacts(false)
 	if err != nil {
 		showError("读取联系人失败: " + err.Error())
 		return
@@ -620,8 +701,11 @@ func ShowProfileWindow(targetContactID int64) {
 		if currentID <= 0 {
 			return
 		}
-		page, err := GetMessagesPage(db, currentID, offset, pageSize)
+		page, err := fetchMessagesPage(currentID, offset, pageSize)
 		if err != nil {
+			// 远程模式下这就是网络/鉴权失败，静默 return 会让界面停在
+			// 上一个联系人的消息上，用户以为「这个人没有聊天记录」
+			showError("读取消息失败: " + err.Error())
 			return
 		}
 		mm.set(page)
@@ -630,6 +714,10 @@ func ShowProfileWindow(targetContactID int64) {
 		prevBtn.SetEnabled(offset > 0)
 		nextBtn.SetEnabled(len(page) >= pageSize)
 	}
+
+	// applyFilter 按搜索框内容过滤联系人列表（同时匹配昵称和备注）。
+	// 在 UI 构建时赋值，refreshContacts 也会调用它，保证刷新后搜索条件不丢失。
+	var applyFilter func()
 
 	// renderProfile 渲染当前联系人的完整画像（全部分区一次铺开）
 	renderProfile := func() {
@@ -653,9 +741,17 @@ func ShowProfileWindow(targetContactID int64) {
 
 	// renderHistory 解析一条历史画像并全量结构化显示
 	renderHistory := func(h ProfileHistory) {
+		// 有些历史记录只是「事件日志」，没有画像快照（比如画像生成失败、
+		// 改名、合并等），ProfileJSON 是空串或 "{}"。这种要直接说明，
+		// 否则会渲染出一整页「暂无记录」，看着像数据坏了。
+		pj := strings.TrimSpace(h.ProfileJSON)
+		if pj == "" || pj == "{}" {
+			historyDetailTE.SetText("该版本没有画像快照\r\n\r\n" + orUnknown(h.ChangeSummary))
+			return
+		}
 		var p Profile
-		if jsonErr := json.Unmarshal([]byte(h.ProfileJSON), &p); jsonErr != nil {
-			historyDetailTE.SetText("历史画像解析失败：\r\n" + h.ProfileJSON)
+		if jsonErr := json.Unmarshal([]byte(pj), &p); jsonErr != nil {
+			historyDetailTE.SetText("历史画像解析失败：\r\n" + pj)
 			return
 		}
 		historyDetailTE.SetText(profileFullText(&p))
@@ -664,8 +760,9 @@ func ShowProfileWindow(targetContactID int64) {
 	// loadContact 刷新右侧全部页签
 	loadContact := func(id int64) {
 		currentID = id
-		contact, err := GetContactByIDWithMerged(db, id)
+		contact, err := fetchContactByID(id)
 		if err != nil {
+			showError("读取联系人详情失败: " + err.Error())
 			return
 		}
 		currentContact = contact
@@ -690,19 +787,33 @@ func ShowProfileWindow(targetContactID int64) {
 		msgDetailTE.SetText("")
 
 		// 历史页
-		history, _ := GetProfileHistory(db, id, 100)
+		history, herr := fetchHistory(id, 100)
 		hm.set(history)
 		hm.PublishItemsReset()
-		if len(history) > 0 {
+		switch {
+		case herr != nil:
+			// 不能和「暂无画像历史」混为一谈：那是没数据，这是取数据失败
+			historyDetailTE.SetText("读取画像历史失败: " + herr.Error())
+		case len(history) > 0:
 			historyLV.SetCurrentIndex(0)
 			renderHistory(history[0])
-		} else {
+		default:
 			historyDetailTE.SetText("暂无画像历史")
 		}
 
-		// 统计页
-		stats, _ := GetContactStats(db, contact.ID)
-		aliases, _ := GetAliases(db, contact.ID)
+		// 统计页。统计只是辅助信息，取失败时不弹模态框打断选人的操作，
+		// 直接在面板上写明，避免显示成一排 "0 条 / 暂无" 让人误判。
+		stats, serr := fetchStats(contact.ID)
+		aliases, aerr := fetchAliases(contact.ID)
+		if serr != nil || aerr != nil {
+			for _, lb := range []*walk.Label{statTotalVal, statMineVal, statOtherVal,
+				statFirstVal, statLastVal, statProfileVal, statAliasVal} {
+				if lb != nil {
+					lb.SetText("读取失败")
+				}
+			}
+			return
+		}
 		aliasStr := strings.Join(aliases, "、")
 		if len(aliases) == 0 {
 			aliasStr = "无"
@@ -716,15 +827,20 @@ func ShowProfileWindow(targetContactID int64) {
 		statAliasVal.SetText(aliasStr)
 	}
 
-	// 刷新联系人列表
+	// 刷新联系人列表：更新闭包共享的 contacts，再重新应用搜索过滤
+	// （旧实现用 := 声明了同名局部变量，外层 contacts 不变，导致搜索基于初始快照，
+	//  刚合并掉的联系人会在搜索结果里复活）
 	refreshContacts := func() {
 		showMerged := showMergedChk.Checked()
-		contacts, err := GetAllContacts(db, showMerged)
+		list, err := fetchContacts(showMerged)
 		if err != nil {
+			// 静默 return 会让列表停在合并/改名之前的旧快照上，
+			// 刚被合并掉的联系人看着像「没合并成功」
+			showError("刷新联系人失败: " + err.Error())
 			return
 		}
-		cm.set(contacts)
-		cm.PublishRowsReset()
+		contacts = list
+		applyFilter()
 	}
 
 	if err := (dl.Dialog{
@@ -826,11 +942,131 @@ func ShowProfileWindow(targetContactID int64) {
 													})
 												},
 											},
+											dl.Composite{
+												Layout: dl.HBox{MarginsZero: true, Spacing: 4},
+												Children: []dl.Widget{
+													dl.PushButton{
+														Text:    "删除联系人…",
+														MinSize: dl.Size{Width: 82, Height: 28},
+														OnClicked: func() {
+															idx := contactsTV.CurrentIndex()
+															if idx < 0 || idx >= len(cm.items) {
+																return
+															}
+															c := cm.items[idx]
+															// 二次确认：删除会把消息、画像、画像历史、别名、合并记录一起清掉，不可恢复
+															if walk.MsgBox(dlg, "删除联系人",
+																fmt.Sprintf("确定删除联系人「%s」吗？\n该联系人的消息、画像、画像历史、别名、合并记录都会被删除，不可恢复。", displayName(&c)),
+																walk.MsgBoxYesNo|walk.MsgBoxIconWarning) != walk.DlgCmdYes {
+																return
+															}
+															if err := doDeleteContact(c.ID); err != nil {
+																walk.MsgBox(dlg, "删除失败", err.Error(), walk.MsgBoxIconError)
+																return
+															}
+															// 删除后右栏还显示着被删联系人的画像，清掉避免误导
+															currentID = 0
+															summaryLabel.SetText("请选择左侧联系人")
+															refreshContacts()
+														},
+													},
+												},
+											},
 											dl.CheckBox{
 												AssignTo: &showMergedChk,
 												Text:     "显示已合并",
 												OnClicked: func() {
 													refreshContacts()
+												},
+											},
+										},
+									},
+									// 第三行：备份 / 恢复（全局操作，与当前选中联系人无关）
+									dl.Composite{
+										Layout: dl.HBox{MarginsZero: true, Spacing: 4},
+										Children: []dl.Widget{
+											dl.PushButton{
+												Text:    "备份…",
+												MinSize: dl.Size{Width: 60, Height: 28},
+												OnClicked: func() {
+													fd := walk.FileDialog{
+														Title:    "保存备份文件",
+														Filter:   "备份文件 (*.zip)|*.zip",
+														FilePath: BackupFileName(time.Now()),
+													}
+													ok, err := fd.ShowSave(dlg)
+													if err != nil {
+														walk.MsgBox(dlg, "备份失败", err.Error(), walk.MsgBoxIconError)
+														return
+													}
+													if !ok || fd.FilePath == "" {
+														return
+													}
+													dest := fd.FilePath
+													if !strings.HasSuffix(strings.ToLower(dest), ".zip") {
+														dest += ".zip"
+													}
+													go func() {
+														err := doExportBackup(dest)
+														dlg.Synchronize(func() {
+															if err != nil {
+																walk.MsgBox(dlg, "备份失败", err.Error(), walk.MsgBoxIconError)
+																return
+															}
+															walk.MsgBox(dlg, "备份完成",
+																"已导出到：\n"+dest+
+																	"\n\n备份含全部聊天画像数据和配置（模型 Key），请妥善保管，换电脑时在新机导入即可。",
+																walk.MsgBoxIconInformation)
+														})
+													}()
+												},
+											},
+											dl.PushButton{
+												Text:    "恢复…",
+												MinSize: dl.Size{Width: 60, Height: 28},
+												OnClicked: func() {
+													fd := walk.FileDialog{
+														Title:  "选择备份文件",
+														Filter: "备份文件 (*.zip)|*.zip",
+													}
+													ok, err := fd.ShowOpen(dlg)
+													if err != nil {
+														walk.MsgBox(dlg, "恢复失败", err.Error(), walk.MsgBoxIconError)
+														return
+													}
+													if !ok || fd.FilePath == "" {
+														return
+													}
+													src := fd.FilePath
+													if walk.MsgBox(dlg, "从备份恢复",
+														"将用备份文件「"+filepath.Base(src)+"」整体替换当前所有联系人、消息和画像数据。\n\n"+
+															"· 恢复前会自动在程序目录留一份「恢复前自动备份」\n"+
+															"· 配置文件恢复后需重启程序生效\n\n确定继续吗？",
+														walk.MsgBoxYesNo|walk.MsgBoxIconWarning) != walk.DlgCmdYes {
+														return
+													}
+													go func() {
+														summary, err := doImportBackup(src)
+														dlg.Synchronize(func() {
+															if err != nil {
+																walk.MsgBox(dlg, "恢复失败", err.Error(), walk.MsgBoxIconError)
+																return
+															}
+															msg := fmt.Sprintf(
+																"恢复完成：\n联系人 %d 个、消息 %d 条、画像历史 %d 条、合并记录 %d 条",
+																summary.Contacts, summary.Messages, summary.Histories, summary.MergeLogs)
+															if len(summary.Files) > 0 {
+																msg += "\n\n配置文件已恢复，重启程序后生效"
+															}
+															if isRemoteMode {
+																msg += "\n\n数据在服务端已即时生效；服务端配置/登录凭据需重启服务"
+															}
+															walk.MsgBox(dlg, "恢复完成", msg, walk.MsgBoxIconInformation)
+															currentID = 0
+															summaryLabel.SetText("请选择左侧联系人")
+															refreshContacts()
+														})
+													}()
 												},
 											},
 										},
@@ -1018,18 +1254,21 @@ func ShowProfileWindow(targetContactID int64) {
 		msgDetailTE.SetText(fmt.Sprintf("%s  %s\r\n\r\n%s", who, ts, m.Content))
 	})
 
-	// 搜索过滤
-	searchLE.TextChanged().Attach(func() {
-		q := strings.TrimSpace(searchLE.Text())
+	// 搜索过滤：昵称、备注、历史昵称都参与匹配，且忽略大小写。
+	// 微信昵称里英文大小写很随意（"Amy" / "amy"），别名更是改名前的旧昵称，
+	// 只按当前昵称精确大小写匹配会让人以为「这个人不在列表里」。
+	applyFilter = func() {
+		q := strings.ToLower(strings.TrimSpace(searchLE.Text()))
 		var shown []Contact
 		for _, c := range contacts {
-			if q == "" || strings.Contains(c.Name, q) {
+			if q == "" || matchContact(c, q) {
 				shown = append(shown, c)
 			}
 		}
 		cm.set(shown)
 		cm.PublishRowsReset()
-	})
+	}
+	searchLE.TextChanged().Attach(applyFilter)
 
 	// 默认选中指定联系人（否则选第一个）
 	selectIdx := 0

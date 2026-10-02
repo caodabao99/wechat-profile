@@ -37,7 +37,7 @@ func showMergeDialog(sourceID int64, sourceName string, onDone func()) {
 	var regenChk *walk.CheckBox
 	var confirmBtn *walk.PushButton
 
-	candidates, err := GetMergeCandidates(db, sourceID)
+	candidates, err := doGetMergeCandidates(sourceID)
 	if err != nil {
 		showError("读取候选联系人失败: " + err.Error())
 		return
@@ -53,6 +53,9 @@ func showMergeDialog(sourceID int64, sourceName string, onDone func()) {
 
 	tm := &mergeTargetModel{items: filtered}
 
+	// 预览里已经查过统计，确认框直接复用这两个值，不再重复查一遍
+	var sourceTotal, targetTotal int64
+
 	// 更新预览
 	updatePreview := func() {
 		idx := targetLB.CurrentIndex()
@@ -63,12 +66,23 @@ func showMergeDialog(sourceID int64, sourceName string, onDone func()) {
 		}
 		target := tm.items[idx]
 
-		sourceStats, _ := GetContactStats(db, sourceID)
-		targetStats, _ := GetContactStats(db, target.ID)
+		sourceStats, serr := fetchStats(sourceID)
+		targetStats, terr := fetchStats(target.ID)
+		if serr != nil || terr != nil {
+			// 统计取不到就不能让用户在「合并后共 0 条」的假数字上点确认
+			err := serr
+			if err == nil {
+				err = terr
+			}
+			previewLabel.SetText("读取消息统计失败: " + err.Error())
+			confirmBtn.SetEnabled(false)
+			return
+		}
+		sourceTotal, targetTotal = sourceStats.Total, targetStats.Total
 
 		previewLabel.SetText(fmt.Sprintf(
 			"合并后共 %d 条消息（源 %d + 目标 %d，重复消息自动去重）",
-			sourceStats.Total+targetStats.Total, sourceStats.Total, targetStats.Total))
+			sourceTotal+targetTotal, sourceTotal, targetTotal))
 		confirmBtn.SetEnabled(true)
 
 		// 默认勾选重生成画像（如果目标消息数达到阈值）
@@ -99,10 +113,11 @@ func showMergeDialog(sourceID int64, sourceName string, onDone func()) {
 				AssignTo:  &targetLE,
 				CueBanner: "搜索目标联系人昵称",
 				OnTextChanged: func() {
-					q := strings.TrimSpace(targetLE.Text())
+					// 与联系人列表的搜索规则保持一致：忽略大小写，备注和历史昵称也参与匹配
+					q := strings.ToLower(strings.TrimSpace(targetLE.Text()))
 					filtered = nil
 					for _, c := range candidates {
-						if q == "" || strings.Contains(c.Name, q) {
+						if q == "" || matchContact(c, q) {
 							filtered = append(filtered, c)
 						}
 					}
@@ -148,11 +163,15 @@ func showMergeDialog(sourceID int64, sourceName string, onDone func()) {
 								return
 							}
 							target := tm.items[idx]
+							if target.ID == sourceID {
+								showError("不能把联系人合并到它自己")
+								return
+							}
 
-							// 二次确认
-							displayName := target.Name
+							// 二次确认（finalName 不叫 displayName，避免遮蔽同名的包级函数）
+							finalName := target.Name
 							if useSourceRB.Checked() {
-								displayName = sourceName
+								finalName = sourceName
 							}
 							msg := fmt.Sprintf(
 								"确认把「%s」合并到「%s」？\n\n"+
@@ -160,36 +179,50 @@ func showMergeDialog(sourceID int64, sourceName string, onDone func()) {
 									"最终显示名：%s\n"+
 									"合并后「%s」的历史昵称将自动归位到该联系人。",
 								sourceName, target.Name,
-								getContactTotal(sourceID), getContactTotal(target.ID),
-								displayName, sourceName)
+								sourceTotal, targetTotal,
+								finalName, sourceName)
 							if walk.MsgBox(dlg, "确认合并", msg, walk.MsgBoxYesNo|walk.MsgBoxIconQuestion) != walk.DlgCmdYes {
 								return
 							}
 
 							// 执行合并
-							opts := MergeOptions{
-								UseSourceNameAsDisplay: useSourceRB.Checked(),
-								RegenerateProfile:      regenChk.Checked(),
-							}
-							result, err := MergeContacts(db, sourceID, target.ID, opts)
+							result, err := doMerge(sourceID, target.ID, useSourceRB.Checked(), regenChk.Checked())
 							if err != nil {
 								showError("合并失败: " + err.Error())
 								return
 							}
 
-							walk.MsgBox(dlg, "合并完成",
-								fmt.Sprintf("已搬移 %d 条消息、%d 条画像历史。", result.MovedMessages, result.MovedHistory),
-								walk.MsgBoxIconInformation)
+							doneMsg := fmt.Sprintf("已搬移 %d 条消息、%d 条画像历史。",
+								result.MovedMessages, result.MovedHistory)
+							if result.ProfileCopied {
+								doneMsg += "\n目标联系人原本没有画像，已把源联系人的画像拷过来。"
+							}
+							if regenChk.Checked() {
+								doneMsg += "\n画像正在后台重新生成，稍后到画像页查看。"
+							}
+							walk.MsgBox(dlg, "合并完成", doneMsg, walk.MsgBoxIconInformation)
 
-							// 异步重新生成画像（合并后没有"本次复制"语境，用目标联系人全部消息）
-							if opts.RegenerateProfile {
+							// 异步重新生成画像（合并后没有"本次复制"语境，用目标联系人全部消息）。
+							// 远程模式不用在这里做：doMerge 传的 regenerate=true 已经让
+							// 服务端自己异步重生成了，这里再跑一遍是白跑，
+							// 还要多拉一整轮分页消息。
+							if regenChk.Checked() && !isRemoteMode {
 								go func() {
-									msgs, err := GetAllMessages(db, target.ID)
-									if err != nil || len(msgs) == 0 {
+									msgs, merr := doGetAllMessages(target.ID)
+									if merr != nil {
+										mainWindow.Synchronize(func() {
+											showError("合并后重生成画像失败：读取消息出错 " + merr.Error())
+										})
 										return
 									}
-									if err := GenerateOrUpdateProfile(db, llmClient, target.ID, displayName, msgs); err != nil {
-										_ = saveProfileHistory(db, target.ID, "{}", "画像生成失败: "+err.Error())
+									if len(msgs) == 0 {
+										return
+									}
+									if gerr := doGenerateOrUpdateProfile(target.ID, finalName, msgs); gerr != nil {
+										_ = doSaveProfileHistory(target.ID, "{}", "画像生成失败: "+gerr.Error())
+										mainWindow.Synchronize(func() {
+											showError("合并后重生成画像失败: " + gerr.Error())
+										})
 									}
 								}()
 							}
@@ -223,11 +256,6 @@ func showMergeDialog(sourceID int64, sourceName string, onDone func()) {
 	dlg.Run()
 }
 
-func getContactTotal(contactID int64) int64 {
-	stats, _ := GetContactStats(db, contactID)
-	return stats.Total
-}
-
 // mergeLogModel 合并记录列表模型
 type mergeLogModel struct {
 	walk.ListModelBase
@@ -247,7 +275,7 @@ func showMergeHistoryDialog(targetContact Contact, onDone func()) {
 	var logLB *walk.ListBox
 	var undoBtn *walk.PushButton
 
-	logs, err := GetMergeLogsForTarget(db, targetContact.ID)
+	logs, err := fetchMergeLogsForTarget(targetContact.ID)
 	if err != nil {
 		showError("读取合并记录失败: " + err.Error())
 		return
@@ -296,13 +324,13 @@ func showMergeHistoryDialog(targetContact Contact, onDone func()) {
 								walk.MsgBoxYesNo|walk.MsgBoxIconQuestion) != walk.DlgCmdYes {
 								return
 							}
-							if err := UndoMerge(db, entry.ID); err != nil {
+							if err := doUndoMerge(entry.ID); err != nil {
 								showError("撤销失败: " + err.Error())
 								return
 							}
 							walk.MsgBox(dlg, "已撤销", "合并已撤销，数据已搬回原联系人。", walk.MsgBoxIconInformation)
 							// 刷新列表
-							newLogs, err := GetMergeLogsForTarget(db, targetContact.ID)
+							newLogs, err := fetchMergeLogsForTarget(targetContact.ID)
 							if err != nil {
 								showError("刷新合并记录失败: " + err.Error())
 								return

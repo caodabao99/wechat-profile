@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/lxn/walk"
 	dl "github.com/lxn/walk/declarative"
@@ -39,7 +40,10 @@ func showRemarkDialog(contact Contact, onDone func()) {
 						Text:    "保存",
 						MinSize: dl.Size{Width: 80, Height: 32},
 						OnClicked: func() {
-							if err := UpdateContactRemark(db, contact.ID, remarkLE.Text()); err != nil {
+							// 必须 TrimSpace：输入框里只打了几个空格会被当成有效备注存下来，
+							// 列表里显示成「（昵称）」这种看不出所以然的样子
+							remark := strings.TrimSpace(remarkLE.Text())
+							if err := doSetRemark(contact.ID, remark); err != nil {
 								showError("保存备注失败: " + err.Error())
 								return
 							}

@@ -11,7 +11,10 @@ import (
 // MergeOptions 合并选项
 type MergeOptions struct {
 	UseSourceNameAsDisplay bool // 显示名改用新昵称（源昵称）
-	RegenerateProfile      bool // 合并完成后异步重生成画像
+	// RegenerateProfile 仅用于画像历史的文案描述。MergeContacts 处在数据层，
+	// 拿不到 LLMClient，自身不会重生成画像；真正的重生成由调用方负责
+	// （bot 端 api.go hMerge / bot.go mergeContacts，桌面端 ui_merge.go）。
+	RegenerateProfile bool
 }
 
 // MergeResult 合并结果
@@ -19,6 +22,26 @@ type MergeResult struct {
 	MovedMessages int
 	MovedHistory  int
 	MergeLogID    int64
+	// ProfileCopied 为 true 表示本次合并把 source 的画像拷贝给了 target。
+	// 撤销合并时必须据此清空 target 的画像，否则 target 会永久留着一份
+	// 基于「source+target 合并消息集」生成的画像。
+	ProfileCopied bool
+}
+
+// isSelfName 判断一个联系人名是不是代表「我本人」。
+// 把别人合并进「我」会让 other_msg_count 归零、画像彻底失真，必须拦掉。
+func isSelfName(name string) bool {
+	n := strings.TrimSpace(name)
+	if n == "" {
+		return false
+	}
+	if n == "我" || strings.EqualFold(n, "me") {
+		return true
+	}
+	if me := strings.TrimSpace(config.MyName); me != "" && n == me {
+		return true
+	}
+	return false
 }
 
 // MergeContacts 把 sourceID 合并到 targetID，单事务完成
@@ -51,8 +74,11 @@ func MergeContacts(db *sql.DB, sourceID, targetID int64, opts MergeOptions) (Mer
 	if targetMerged.Valid {
 		return result, fmt.Errorf("目标联系人已被合并")
 	}
-	if sourceName == config.MyName || sourceName == "我" || sourceName == "Me" || sourceName == "me" {
+	if isSelfName(sourceName) {
 		return result, fmt.Errorf("不能合并自己")
+	}
+	if isSelfName(targetName) {
+		return result, fmt.Errorf("不能把其他联系人合并进自己")
 	}
 
 	tx, err := db.Begin()
@@ -114,12 +140,13 @@ func MergeContacts(db *sql.DB, sourceID, targetID int64, opts MergeOptions) (Mer
 	result.MovedHistory = int(movedHist)
 
 	// 5. 画像迁移：target 为空且 source 有画像 → 拷贝
-	var targetProfileJSON string
-	err = tx.QueryRow(`SELECT COALESCE(profile_json, '') FROM contacts WHERE id = ?`, targetID).
-		Scan(&targetProfileJSON)
+	var targetProfileJSON, targetProfileSummary string
+	err = tx.QueryRow(`SELECT COALESCE(profile_json, ''), COALESCE(profile_summary, '') FROM contacts WHERE id = ?`, targetID).
+		Scan(&targetProfileJSON, &targetProfileSummary)
 	if err != nil {
 		return result, err
 	}
+	profileCopied := false
 	if targetProfileJSON == "" || targetProfileJSON == "{}" {
 		var sourceProfileJSON, sourceProfileSummary string
 		err = tx.QueryRow(`SELECT COALESCE(profile_json, ''), COALESCE(profile_summary, '') FROM contacts WHERE id = ?`, sourceID).
@@ -132,8 +159,12 @@ func MergeContacts(db *sql.DB, sourceID, targetID int64, opts MergeOptions) (Mer
 				sourceProfileJSON, sourceProfileSummary, time.Now().Format(time.RFC3339), targetID); err != nil {
 				return result, err
 			}
+			// 记下拷贝事实：撤销合并时要靠它把 target 的画像清空
+			profileCopied = true
+			targetProfileJSON, targetProfileSummary = sourceProfileJSON, sourceProfileSummary
 		}
 	}
+	result.ProfileCopied = profileCopied
 
 	// 6. 重算 target 的 other_msg_count（全量，不能累加）
 	if _, err := tx.Exec(`UPDATE contacts SET other_msg_count = (
@@ -155,16 +186,11 @@ func MergeContacts(db *sql.DB, sourceID, targetID int64, opts MergeOptions) (Mer
 		}
 	}
 
-	// 8. 登记别名（source 旧名和 target 当前名）
-	// 注意：如果用了 UseSourceNameAsDisplay，target 当前名已变成 sourceName，要记录的是 target 原来的名字
-	aliasSourceName := sourceName
-	aliasTargetName := targetName
-	if opts.UseSourceNameAsDisplay {
-		// 此时 target 的 name 已变成 sourceName，aliasTargetName 应该是 target 原来的名字
-		// 但 targetName 变量存的就是原来的名字，所以是对的
-	}
-
-	for _, alias := range []string{aliasSourceName, aliasTargetName} {
+	// 8. 登记别名（source 旧名和 target 原名的旧值）
+	// targetName 变量在函数开头就取好了，是 target 改名前的名字，
+	// 因此即使 UseSourceNameAsDisplay 把 target 改成了 sourceName，
+	// 这里登记的两条别名依然是「source 原名」和「target 原名」。
+	for _, alias := range []string{sourceName, targetName} {
 		if alias == "" {
 			continue
 		}
@@ -183,10 +209,10 @@ func MergeContacts(db *sql.DB, sourceID, targetID int64, opts MergeOptions) (Mer
 	// 10. 写 merge_log
 	msgIDsJSON, _ := json.Marshal(msgIDs)
 	historyIDsJSON, _ := json.Marshal(historyIDs)
-	res, err = tx.Exec(`INSERT INTO merge_log (source_id, target_id, source_name, target_name, moved_message_ids, moved_history_ids, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)`,
+	res, err = tx.Exec(`INSERT INTO merge_log (source_id, target_id, source_name, target_name, moved_message_ids, moved_history_ids, profile_copied, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 		sourceID, targetID, sourceName, targetName, string(msgIDsJSON), string(historyIDsJSON),
-		time.Now().Format(time.RFC3339))
+		profileCopied, time.Now().Format(time.RFC3339))
 	if err != nil {
 		return result, err
 	}
@@ -194,13 +220,22 @@ func MergeContacts(db *sql.DB, sourceID, targetID int64, opts MergeOptions) (Mer
 
 	// 11. 合并事件写入目标的画像历史（必须在事务内写——saveProfileHistory 会再加 dbMu 锁，
 	// 而本函数持有锁未释放，事务外调用会死锁，表现为点击确认后程序卡死）
+	// profile_json 存合并后 target 的真实画像快照，而不是空对象 "{}"：
+	// 否则历史页会出现一条「有摘要但画像内容全空」的记录，看起来像数据丢失。
 	summary := fmt.Sprintf("合并联系人「%s」：搬移 %d 条消息、%d 条画像历史",
 		sourceName, result.MovedMessages, result.MovedHistory)
+	if profileCopied {
+		summary += "，并沿用源联系人的画像"
+	}
 	if opts.RegenerateProfile {
-		summary += "，并重新生成画像"
+		summary += "，画像将在后台重新生成"
+	}
+	snapshot := strings.TrimSpace(targetProfileJSON)
+	if snapshot == "" {
+		snapshot = "{}"
 	}
 	if _, err := tx.Exec(`INSERT INTO profile_history (contact_id, profile_json, change_summary, created_at)
-		VALUES (?, ?, ?, ?)`, targetID, "{}", summary, time.Now().Format(time.RFC3339)); err != nil {
+		VALUES (?, ?, ?, ?)`, targetID, snapshot, summary, time.Now().Format(time.RFC3339)); err != nil {
 		return result, err
 	}
 
@@ -232,13 +267,13 @@ func GetMergeCandidates(db *sql.DB, excludeID int64) ([]Contact, error) {
 		        COALESCE(profile_summary,''), other_msg_count,
 		        COALESCE(last_updated,''), created_at
 		 FROM contacts WHERE merged_into IS NULL AND id != ?
-		 ORDER BY last_updated DESC, id DESC`, excludeID)
+		 ORDER BY strftime('%s', last_updated) DESC, id DESC`, excludeID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	var out []Contact
+	out := []Contact{} // 空结果也返回 [] 而非 nil（JSON null）
 	for rows.Next() {
 		var c Contact
 		if err := rows.Scan(&c.ID, &c.Name, &c.Remark, &c.ProfileJSON,
@@ -262,12 +297,14 @@ func UndoMerge(db *sql.DB, mergeLogID int64) error {
 		TargetName      string
 		MovedMessageIDs string
 		MovedHistoryIDs string
+		ProfileCopied   int
 		UndoneAt        sql.NullString
 	}
-	err := db.QueryRow(`SELECT source_id, target_id, source_name, target_name, moved_message_ids, moved_history_ids, undone_at
+	err := db.QueryRow(`SELECT source_id, target_id, source_name, target_name, moved_message_ids, moved_history_ids,
+		COALESCE(profile_copied, 0), undone_at
 		FROM merge_log WHERE id = ?`, mergeLogID).
 		Scan(&log.SourceID, &log.TargetID, &log.SourceName, &log.TargetName,
-			&log.MovedMessageIDs, &log.MovedHistoryIDs, &log.UndoneAt)
+			&log.MovedMessageIDs, &log.MovedHistoryIDs, &log.ProfileCopied, &log.UndoneAt)
 	if err != nil {
 		return fmt.Errorf("合并日志不存在: %w", err)
 	}
@@ -308,13 +345,55 @@ func UndoMerge(db *sql.DB, mergeLogID int64) error {
 		}
 	}
 
-	// 4. 恢复双方名字（合并时若选了用新昵称显示，target 被改成了 source 的名字，
-	// 必须先把 target 改回它自己的原名，否则恢复 source 名字会撞 UNIQUE）
-	if _, err := tx.Exec(`UPDATE contacts SET name = ? WHERE id = ?`, log.TargetName, log.TargetID); err != nil {
+	// 4. 恢复名称：
+	//    - target 仅当初用 source 名作显示（当前名 == log.SourceName）时才改回 log.TargetName，
+	//      否则保留用户合并后可能改过的新名字；
+	//    - log.TargetName 已被别的联系人占用时，退而用 "log.TargetName#undo-<logID>" 这个唯一
+	//      回退名。目的是腾出 log.SourceName：source 的名字是后续消息匹配用的身份，
+	//      比 target 的显示名更重要，不能让它永久卡在 "xxx#merged-<id>" 临时名上；
+	//    - source 从 "xxx#merged-<id>" 临时名改回 log.SourceName；
+	//    - 任何情况下都不让 UNIQUE 冲突中断撤销。
+	nameTaken := func(name string, exceptID int64) bool {
+		var id int64
+		err := tx.QueryRow(`SELECT id FROM contacts WHERE name = ?`, name).Scan(&id)
+		return err == nil && id != exceptID
+	}
+
+	var curTargetName, curSourceName string
+	if err := tx.QueryRow(`SELECT name FROM contacts WHERE id = ?`, log.TargetID).Scan(&curTargetName); err == nil {
+		if curTargetName == log.SourceName {
+			newName := log.TargetName
+			if nameTaken(newName, log.TargetID) {
+				newName = fmt.Sprintf("%s#undo-%d", log.TargetName, mergeLogID)
+			}
+			if newName != curTargetName && !nameTaken(newName, log.TargetID) {
+				if _, err := tx.Exec(`UPDATE contacts SET name = ? WHERE id = ?`, newName, log.TargetID); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	if err := tx.QueryRow(`SELECT name FROM contacts WHERE id = ?`, log.SourceID).Scan(&curSourceName); err == nil {
+		if curSourceName != log.SourceName && !nameTaken(log.SourceName, log.SourceID) {
+			if _, err := tx.Exec(`UPDATE contacts SET name = ? WHERE id = ?`, log.SourceName, log.SourceID); err != nil {
+				return err
+			}
+		}
+	}
+
+	// 4b. 回收别名：合并时把 source 名和 target 名都登记成了 target 的别名，
+	//     撤销后 source 名必须归还给 source，否则 FindContactID 会解析到错误的联系人。
+	if _, err := tx.Exec(`UPDATE contact_aliases SET contact_id = ? WHERE alias = ? AND contact_id = ?`,
+		log.SourceID, log.SourceName, log.TargetID); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(`UPDATE contacts SET name = ? WHERE id = ?`, log.SourceName, log.SourceID); err != nil {
-		return err
+	// 别名与自己当前名字相同的记录是冗余的（名字匹配优先于别名），顺手清掉
+	for _, cid := range []int64{log.SourceID, log.TargetID} {
+		if _, err := tx.Exec(
+			`DELETE FROM contact_aliases WHERE contact_id = ? AND alias = (SELECT name FROM contacts WHERE id = ?)`,
+			cid, cid); err != nil {
+			return err
+		}
 	}
 
 	// 5. 重算双方计数
@@ -322,6 +401,16 @@ func UndoMerge(db *sql.DB, mergeLogID int64) error {
 		if _, err := tx.Exec(`UPDATE contacts SET other_msg_count = (
 			SELECT COUNT(*) FROM messages WHERE contact_id = ? AND sender = 'other'
 		) WHERE id = ?`, cid, cid); err != nil {
+			return err
+		}
+	}
+
+	// 5b. 回滚画像拷贝：合并时若把 source 的画像拷给了 target，撤销后 target 的消息集
+	//     已经变回去了，那份画像（尤其是合并后又基于合并消息集重新生成过的）不再可信，
+	//     必须清空，让它下次重新生成。
+	if log.ProfileCopied != 0 {
+		if _, err := tx.Exec(`UPDATE contacts SET profile_json = '{}', profile_summary = '' WHERE id = ?`,
+			log.TargetID); err != nil {
 			return err
 		}
 	}
@@ -334,11 +423,21 @@ func UndoMerge(db *sql.DB, mergeLogID int64) error {
 
 	// 7. 撤销事件写入双方的画像历史（必须在事务内——saveProfileHistory 会再加 dbMu 锁，
 	// 本函数持锁未释放时调用会死锁）
+	// profile_json 存撤销后各自的真实画像快照，而不是硬编码的 "{}"，
+	// 否则历史页会出现「有摘要但内容全空」的记录。
 	summary := fmt.Sprintf("撤销合并「%s」：消息与画像历史已搬回", log.SourceName)
 	now := time.Now().Format(time.RFC3339)
 	for _, cid := range []int64{log.SourceID, log.TargetID} {
+		snapshot := "{}"
+		if err := tx.QueryRow(`SELECT COALESCE(profile_json, '{}') FROM contacts WHERE id = ?`, cid).
+			Scan(&snapshot); err != nil && err != sql.ErrNoRows {
+			return err
+		}
+		if strings.TrimSpace(snapshot) == "" {
+			snapshot = "{}"
+		}
 		if _, err := tx.Exec(`INSERT INTO profile_history (contact_id, profile_json, change_summary, created_at)
-			VALUES (?, ?, ?, ?)`, cid, "{}", summary, now); err != nil {
+			VALUES (?, ?, ?, ?)`, cid, snapshot, summary, now); err != nil {
 			return err
 		}
 	}
@@ -355,13 +454,15 @@ func GetAliases(db *sql.DB, contactID int64) ([]string, error) {
 	dbMu.Lock()
 	defer dbMu.Unlock()
 
-	rows, err := db.Query(`SELECT alias FROM contact_aliases WHERE contact_id = ? ORDER BY created_at`, contactID)
+	// created_at 在老库里混有 CURRENT_TIMESTAMP（UTC）与 RFC3339（本地时间）两种格式，
+	// 按它排序结果不可靠；id 单调递增，用它保证「先登记的别名排前面」。
+	rows, err := db.Query(`SELECT alias FROM contact_aliases WHERE contact_id = ? ORDER BY id`, contactID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	var out []string
+	out := []string{} // 空结果也返回 [] 而非 nil（JSON null）
 	for rows.Next() {
 		var alias string
 		if err := rows.Scan(&alias); err != nil {
@@ -388,7 +489,9 @@ func GetMergeLogs(db *sql.DB, limit int) ([]MergeLogEntry, error) {
 	}
 	defer rows.Close()
 
-	var out []MergeLogEntry
+	// 初始化为空切片而不是 nil：无记录时 JSON 序列化成 [] 而不是 null。
+	// 网页端拿到 null 后访问 .length 会抛 TypeError 导致整个页面渲染崩溃白屏。
+	out := []MergeLogEntry{}
 	for rows.Next() {
 		var e MergeLogEntry
 		var undoneAt sql.NullString
@@ -426,7 +529,9 @@ func GetMergeLogsForTarget(db *sql.DB, targetID int64) ([]MergeLogEntry, error) 
 	}
 	defer rows.Close()
 
-	var out []MergeLogEntry
+	// 初始化为空切片而不是 nil：无记录时 JSON 序列化成 [] 而不是 null。
+	// 网页端拿到 null 后访问 .length 会抛 TypeError 导致整个页面渲染崩溃白屏。
+	out := []MergeLogEntry{}
 	for rows.Next() {
 		var e MergeLogEntry
 		var undoneAt sql.NullString
@@ -478,7 +583,8 @@ func GetContactByIDWithMerged(db *sql.DB, id int64) (*Contact, error) {
 	}
 
 	// 内联查询别名（不能调 GetAliases，会重复加 dbMu 锁导致死锁）
-	rows, err := db.Query(`SELECT alias FROM contact_aliases WHERE contact_id = ? ORDER BY created_at`, id)
+	// 同 GetAliases：created_at 格式不统一，用 id 排序才可靠
+	rows, err := db.Query(`SELECT alias FROM contact_aliases WHERE contact_id = ? ORDER BY id`, id)
 	if err != nil {
 		return nil, err
 	}
@@ -494,6 +600,9 @@ func GetContactByIDWithMerged(db *sql.DB, id int64) (*Contact, error) {
 }
 
 // UpdateContactName 更新联系人显示名（同时处理 UNIQUE 冲突）
+//
+// 改名后必须把旧名字登记成别名：消息入库时是按「名字 → 别名 → 新建」三级匹配的，
+// 如果旧名字没留成别名，之后仍带旧昵称发来的历史消息会被建出一个新的重复联系人。
 func UpdateContactName(db *sql.DB, contactID int64, newName string) error {
 	dbMu.Lock()
 	defer dbMu.Unlock()
@@ -501,6 +610,9 @@ func UpdateContactName(db *sql.DB, contactID int64, newName string) error {
 	newName = strings.TrimSpace(newName)
 	if newName == "" {
 		return fmt.Errorf("名称不能为空")
+	}
+	if isSelfName(newName) {
+		return fmt.Errorf("不能使用自己的名字作为联系人名称")
 	}
 
 	// 检查新名字是否已被占用
@@ -513,6 +625,37 @@ func UpdateContactName(db *sql.DB, contactID int64, newName string) error {
 		return err
 	}
 
-	_, err = db.Exec(`UPDATE contacts SET name = ? WHERE id = ?`, newName, contactID)
-	return err
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	var oldName string
+	if err := tx.QueryRow(`SELECT name FROM contacts WHERE id = ?`, contactID).Scan(&oldName); err != nil {
+		return fmt.Errorf("联系人不存在: %w", err)
+	}
+	if oldName == newName {
+		return tx.Commit()
+	}
+
+	if _, err := tx.Exec(`UPDATE contacts SET name = ?, last_updated = ? WHERE id = ?`,
+		newName, time.Now().Format(time.RFC3339), contactID); err != nil {
+		return err
+	}
+
+	// 新名字既然已经成了本联系人的正式名字，就不该再留一条同名别名
+	if _, err := tx.Exec(`DELETE FROM contact_aliases WHERE alias = ? AND contact_id = ?`,
+		newName, contactID); err != nil {
+		return err
+	}
+
+	// 旧名字转成别名（旧名字可能已挂在别的联系人上，用 upsert 抢过来）
+	if _, err := tx.Exec(`INSERT INTO contact_aliases (contact_id, alias, created_at) VALUES (?, ?, ?)
+		ON CONFLICT(alias) DO UPDATE SET contact_id = excluded.contact_id`,
+		contactID, oldName, time.Now().Format(time.RFC3339)); err != nil {
+		return err
+	}
+
+	return tx.Commit()
 }

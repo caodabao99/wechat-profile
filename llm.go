@@ -1,9 +1,11 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 	"time"
 
@@ -48,6 +50,22 @@ type chatResponse struct {
 // Call 发送一次对话请求，要求模型输出 JSON。
 // 网络或接口失败时自动重试一次。
 func (c *LLMClient) Call(prompt string) (string, error) {
+	return c.CallContext(context.Background(), prompt)
+}
+
+// isRetryableStatus 判断 HTTP 状态码是否值得重试。
+// 401/403/404/400 属于配置或请求本身的问题，重试必然得到同样的结果；
+// 早先这里对所有 IsError() 一律重试，导致每次配置错误都要白等 2 秒再叠加一次
+// 完整超时（客户端超时 60s，最坏一次调用 ~122s 才返回错误）。
+// 只有 429（限流）和 5xx（服务端故障）才可能有瞬态性。
+func isRetryableStatus(code int) bool {
+	return code == http.StatusTooManyRequests || code >= 500
+}
+
+// CallContext 与 Call 相同，但接受 ctx 用于取消/超时控制。
+// HTTP 请求走 resty 的 SetContext，重试等待也感知 ctx，
+// 避免调用方已经放弃后仍在后台占用 LLM 配额。
+func (c *LLMClient) CallContext(ctx context.Context, prompt string) (string, error) {
 	body := map[string]interface{}{
 		"model": c.model,
 		"messages": []map[string]string{
@@ -68,10 +86,15 @@ func (c *LLMClient) Call(prompt string) (string, error) {
 	var lastErr error
 	for attempt := 0; attempt < 2; attempt++ {
 		if attempt > 0 {
-			time.Sleep(2 * time.Second)
+			select {
+			case <-ctx.Done():
+				return "", ctx.Err()
+			case <-time.After(2 * time.Second):
+			}
 		}
 
 		resp, err := c.http.R().
+			SetContext(ctx).
 			SetHeader("Authorization", "Bearer "+c.apiKey).
 			SetBody(body).
 			Post(c.baseURL + "/chat/completions")
@@ -82,6 +105,9 @@ func (c *LLMClient) Call(prompt string) (string, error) {
 		if resp.IsError() {
 			lastErr = fmt.Errorf("模型接口返回 %d: %s", resp.StatusCode(),
 				strings.TrimSpace(string(resp.Body())))
+			if !isRetryableStatus(resp.StatusCode()) {
+				return "", lastErr
+			}
 			continue
 		}
 

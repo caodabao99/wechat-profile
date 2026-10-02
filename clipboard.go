@@ -46,7 +46,11 @@ func ReadClipboard() (string, error) {
 	return text, nil
 }
 
-// ResetClipboardHash 清空去重记录（目前未使用，保留给后续"强制重新识别"场景）
+// ResetClipboardHash 清空去重记录，让下一次 ReadClipboard 接受同样的内容。
+//
+// ReadClipboard 一读到内容就更新了 lastClipboardHash，但后面的落库/分析可能失败
+// （网络抖动、服务端 5xx）。不调用它的话，用户必须重新复制一遍才能重试。
+// 只在「重试同样内容有可能成功」的失败路径上调用；解析不出消息这种确定性失败不要调。
 func ResetClipboardHash() {
 	clipboardMu.Lock()
 	defer clipboardMu.Unlock()

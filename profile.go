@@ -1,12 +1,16 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 // ImportantDates 重要日子列表。模型可能返回 []string，也可能返回 map（如 {"生日":"5月20日"}），
@@ -79,6 +83,39 @@ type Profile struct {
 	Summary            string             `json:"summary"`         // 100 字内核心概括
 }
 
+// ErrProfileBusy 表示该联系人的画像正在生成中。
+// 画像是「读旧 JSON → 调 LLM → 写回」的非原子过程，同一联系人并发跑两次时，
+// 后写的一方会用自己那份旧 JSON 覆盖前者的结果，用户手动补充的信息可能凭空消失。
+var ErrProfileBusy = errors.New("该联系人的画像正在生成中，请稍后再试")
+
+var (
+	// profileGuard 只保护 profileLocks 这张表本身，持锁时间极短，
+	// 且一定在 dbMu 之外获取（先 profileGuard 后 dbMu），不存在反向持锁的路径。
+	profileGuard sync.Mutex
+	profileLocks = make(map[int64]*sync.Mutex)
+)
+
+// tryLockProfile 尝试为某个联系人取画像生成锁。
+// 成功时返回解锁函数；已被占用时返回 false，调用方应把 ErrProfileBusy 反馈给用户。
+//
+// 这里刻意用 TryLock 而不是阻塞等锁：一次画像生成最坏要等 LLM 两轮超时（~122s），
+// 让用户请求干等这么久不如立刻告知「正在生成」。
+// 锁表按 contactID 常驻不回收，条目数等于联系人数，量级可忽略。
+func tryLockProfile(contactID int64) (func(), bool) {
+	profileGuard.Lock()
+	mu, ok := profileLocks[contactID]
+	if !ok {
+		mu = &sync.Mutex{}
+		profileLocks[contactID] = mu
+	}
+	profileGuard.Unlock()
+
+	if !mu.TryLock() {
+		return nil, false
+	}
+	return mu.Unlock, true
+}
+
 // getContactProfileFields 读取联系人的画像字段（含上次生成画像时的对方消息数）
 func getContactProfileFields(db *sql.DB, contactID int64) (otherCount int, profileJSON string, profileMsgCount int, err error) {
 	dbMu.Lock()
@@ -135,9 +172,42 @@ func formatMessagesForPrompt(messages []Message) string {
 	return b.String()
 }
 
+// maxPromptMessageRunes 聊天记录拼进 prompt 的长度上限（按 rune 计）。
+// 多选复制上千条消息时，早先这里会把全部内容原样塞进 prompt：
+// 一是必然超过模型上下文窗口直接 400，二是 token 费用无上限。
+// 12000 个 rune 约等于 1.2 万汉字，对主流模型的上下文足够安全。
+const maxPromptMessageRunes = 12000
+
+// formatMessagesForPromptLimited 与 formatMessagesForPrompt 相同，但带长度保护。
+// 超限时保留**最近**的消息（越靠近当下的对话越能反映这个人现在的状态），
+// 并在开头注明省略了多少条，避免模型把残缺对话误当成全部事实。
+// 按整条消息丢弃，不会截断出半句话。
+func formatMessagesForPromptLimited(messages []Message) string {
+	if len(messages) == 0 {
+		return ""
+	}
+	start := 0
+	for {
+		s := formatMessagesForPrompt(messages[start:])
+		if utf8.RuneCountInString(s) <= maxPromptMessageRunes || start >= len(messages)-1 {
+			if start > 0 {
+				return fmt.Sprintf("（较早的 %d 条消息因长度限制已省略）\n%s", start, s)
+			}
+			return s
+		}
+		// 每轮丢掉最早的四分之一，总开销约 4n，避免逐条试探的 O(n²)
+		cut := (len(messages) - start) / 4
+		if cut < 1 {
+			cut = 1
+		}
+		start += cut
+	}
+}
+
 // GenerateOrUpdateProfile 生成或更新联系人画像，并写入历史。
 // messages 为本次用于生成画像的聊天记录（通常是本次复制的消息；合并重生成时为该联系人全部消息）。
-func GenerateOrUpdateProfile(db *sql.DB, llmClient *LLMClient, contactID int64, contactName string, messages []Message) error {
+// 同一联系人已有画像任务在跑时返回 ErrProfileBusy，调用方应原样反馈给用户。
+func GenerateOrUpdateProfile(ctx context.Context, db *sql.DB, llmClient *LLMClient, contactID int64, contactName string, messages []Message) error {
 	// 防护：如果联系人已被合并，重定向到目标联系人
 	merged, targetID, err := IsMerged(db, contactID)
 	if err != nil {
@@ -153,9 +223,21 @@ func GenerateOrUpdateProfile(db *sql.DB, llmClient *LLMClient, contactID int64, 
 		contactName = target.Name
 	}
 
+	// 必须放在重定向之后：锁要锁在「最终真正被写入的那个联系人」上，
+	// 否则两个分别指向同一 target 的 source 仍能并发改写 target 的画像。
+	unlock, ok := tryLockProfile(contactID)
+	if !ok {
+		return ErrProfileBusy
+	}
+	defer unlock()
+
 	contact, err := GetContactByID(db, contactID)
 	if err != nil {
 		return fmt.Errorf("读取联系人失败: %w", err)
+	}
+	// 调用方未提供名字时用库里存的名字，避免 prompt 里「联系人：」为空影响 LLM 判断
+	if strings.TrimSpace(contactName) == "" {
+		contactName = contact.Name
 	}
 	oldJSON := strings.TrimSpace(contact.ProfileJSON)
 	if oldJSON == "" {
@@ -191,9 +273,9 @@ func GenerateOrUpdateProfile(db *sql.DB, llmClient *LLMClient, contactID int64, 
 %s
 【新增聊天记录】
 %s
-请只输出 JSON，不要其他内容。`, contactName, oldJSON, formatMessagesForPrompt(messages))
+请只输出 JSON，不要其他内容。`, contactName, oldJSON, formatMessagesForPromptLimited(messages))
 
-	raw, err := llmClient.Call(prompt)
+	raw, err := llmClient.CallContext(ctx, prompt)
 	if err != nil {
 		return fmt.Errorf("生成画像失败: %w", err)
 	}
@@ -210,7 +292,7 @@ func GenerateOrUpdateProfile(db *sql.DB, llmClient *LLMClient, contactID int64, 
 	newJSON := string(newJSONBytes)
 
 	// 用模型生成一句话的本次变化说明（失败不影响主流程）
-	changeSummary := summarizeProfileChange(llmClient, oldJSON, newJSON)
+	changeSummary := summarizeProfileChange(ctx, llmClient, oldJSON, newJSON)
 
 	if err := SaveProfile(db, contactID, newJSON, profile.Summary, changeSummary); err != nil {
 		return fmt.Errorf("保存画像失败: %w", err)
@@ -219,7 +301,7 @@ func GenerateOrUpdateProfile(db *sql.DB, llmClient *LLMClient, contactID int64, 
 }
 
 // summarizeProfileChange 让模型用一句话概括画像变化；任何失败都返回兜底文案
-func summarizeProfileChange(llmClient *LLMClient, oldJSON, newJSON string) string {
+func summarizeProfileChange(ctx context.Context, llmClient *LLMClient, oldJSON, newJSON string) string {
 	prompt := fmt.Sprintf(`对比下面两份人物画像 JSON，用一句中文（30 字以内）概括新画像相对旧画像的主要变化。
 如果除了首次生成外没有实质变化，也请简述新增了哪些信息。
 只输出 JSON：{"change_summary": "一句话"}
@@ -228,7 +310,7 @@ func summarizeProfileChange(llmClient *LLMClient, oldJSON, newJSON string) strin
 【新画像】
 %s`, oldJSON, newJSON)
 
-	raw, err := llmClient.Call(prompt)
+	raw, err := llmClient.CallContext(ctx, prompt)
 	if err != nil {
 		return "画像已更新"
 	}
@@ -241,11 +323,24 @@ func summarizeProfileChange(llmClient *LLMClient, oldJSON, newJSON string) strin
 	return strings.TrimSpace(out.ChangeSummary)
 }
 
-// SupplementProfile 把用户手动提供的信息补充进画像
-func SupplementProfile(db *sql.DB, llmClient *LLMClient, contactID int64, contactName string, userNote string) error {
+// SupplementProfile 把用户手动提供的信息补充进画像。
+// 同一联系人已有画像任务在跑时返回 ErrProfileBusy：手动补充的信息是用户第一手资料，
+// 一旦被并发的自动生成覆盖就再也找不回来，宁可让用户稍后重试。
+func SupplementProfile(ctx context.Context, db *sql.DB, llmClient *LLMClient, contactID int64, contactName string, userNote string) error {
+	unlock, ok := tryLockProfile(contactID)
+	if !ok {
+		return ErrProfileBusy
+	}
+	defer unlock()
+
 	contact, err := GetContactByID(db, contactID)
 	if err != nil {
 		return fmt.Errorf("读取联系人失败: %w", err)
+	}
+	// 调用方未提供名字时回落到库里的名字，与 GenerateOrUpdateProfile 一致：
+	// prompt 里「联系人：」为空会让模型丢失最基本的主体信息，影响字段归属判断。
+	if strings.TrimSpace(contactName) == "" {
+		contactName = contact.Name
 	}
 	oldJSON := strings.TrimSpace(contact.ProfileJSON)
 	if oldJSON == "" {
@@ -267,7 +362,7 @@ func SupplementProfile(db *sql.DB, llmClient *LLMClient, contactID int64, contac
 %s
 请只输出 JSON，不要其他内容。`, contactName, oldJSON, strings.TrimSpace(userNote))
 
-	raw, err := llmClient.Call(prompt)
+	raw, err := llmClient.CallContext(ctx, prompt)
 	if err != nil {
 		return fmt.Errorf("补充画像失败: %w", err)
 	}
@@ -294,7 +389,7 @@ func SupplementProfile(db *sql.DB, llmClient *LLMClient, contactID int64, contac
 
 // AnalyzeIntent 结合画像与本次复制的对话，分析对方最新消息的意图。
 // messages 为本次多选复制解析出的消息（不限条数），不按历史累计加载。
-func AnalyzeIntent(db *sql.DB, llmClient *LLMClient, contactID int64, newMessage string, messages []Message) (map[string]interface{}, error) {
+func AnalyzeIntent(ctx context.Context, db *sql.DB, llmClient *LLMClient, contactID int64, newMessage string, messages []Message) (map[string]interface{}, error) {
 	contact, err := GetContactByID(db, contactID)
 	if err != nil {
 		return nil, fmt.Errorf("读取联系人失败: %w", err)
@@ -321,9 +416,9 @@ func AnalyzeIntent(db *sql.DB, llmClient *LLMClient, contactID int64, newMessage
   "confidence": 0.0
 }
 只输出 JSON，不要其他内容。`,
-		profileSummary, formatMessagesForPrompt(messages), strings.TrimSpace(newMessage))
+		profileSummary, formatMessagesForPromptLimited(messages), strings.TrimSpace(newMessage))
 
-	raw, err := llmClient.Call(prompt)
+	raw, err := llmClient.CallContext(ctx, prompt)
 	if err != nil {
 		return nil, err
 	}

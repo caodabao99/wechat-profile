@@ -4,6 +4,7 @@ import (
 	"crypto/md5"
 	"database/sql"
 	"encoding/hex"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
@@ -181,24 +182,86 @@ func migrate(db *sql.DB) error {
 		}
 	}
 
-	// 自清洗：测试期曾用 v3 迁移把 last_updated 错误 +8 小时，导致出现"未来时间"（如 22:45 比当前还晚）。
-	// 所有 last_updated 超过当前时间的值都是这种脏数据，统一重置为当前时间。
-	// 正常写入的时间永远不会是未来时间，所以这个条件只命中脏数据。
-	now := time.Now().Format(time.RFC3339)
-	if _, err := db.Exec(`UPDATE contacts SET last_updated = ? WHERE last_updated > ?`, now, now); err != nil {
-		return err
+	if version < 3 {
+		// v3: 一次性自清洗。测试期曾用 v3 迁移把 last_updated 错误 +8 小时，
+		// 导致出现"未来时间"（如 22:45 比当前还晚）。所有 last_updated 超过当前
+		// 时间的值都是这种脏数据，统一重置为当前时间。
+		// 正常写入的时间永远不会是未来时间，所以这个条件只命中脏数据。
+		//
+		// 必须挂在版本号下：早先它无条件跑在每次 InitDB 里，库变大后每次启动
+		// 都要全表扫描一次 contacts，且迁移语义被冲淡。
+		now := time.Now().Format(time.RFC3339)
+		if _, err := db.Exec(`UPDATE contacts SET last_updated = ? WHERE last_updated > ?`, now, now); err != nil {
+			return err
+		}
+		if _, err := db.Exec(`PRAGMA user_version = 3`); err != nil {
+			return err
+		}
+	}
+
+	if version < 4 {
+		// v4: merge_log 增加 profile_copied，记录本次合并是否把 source 的画像
+		// 拷贝给了 target。撤销合并时必须据此把 target 的画像清空，
+		// 否则 target 会永久留着一份基于「source+target 合并消息集」生成的画像，
+		// 而它的消息集在撤销后已经变回去了。
+		var colCount int
+		if err := db.QueryRow(
+			`SELECT COUNT(*) FROM pragma_table_info('merge_log') WHERE name='profile_copied'`).
+			Scan(&colCount); err != nil {
+			return err
+		}
+		if colCount == 0 {
+			if _, err := db.Exec(
+				`ALTER TABLE merge_log ADD COLUMN profile_copied INTEGER DEFAULT 0`); err != nil {
+				return err
+			}
+		}
+		if _, err := db.Exec(`PRAGMA user_version = 4`); err != nil {
+			return err
+		}
+	}
+
+	if version < 5 {
+		// v5: 备份/恢复操作日志。只追加不修改，恢复备份时本表不参与整体替换，
+		// 保证「这台机器上发生过什么备份操作」的历史不会因恢复旧备份而丢失。
+		if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS backup_log (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		action TEXT NOT NULL CHECK(action IN ('export', 'import')),
+		source TEXT NOT NULL DEFAULT '',
+		filename TEXT DEFAULT '',
+		size_bytes INTEGER DEFAULT 0,
+		detail TEXT DEFAULT '',
+		success INTEGER NOT NULL DEFAULT 1,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	)`); err != nil {
+			return err
+		}
+		if _, err := db.Exec(`PRAGMA user_version = 5`); err != nil {
+			return err
+		}
 	}
 	return nil
 }
 
-// messageHash 计算消息去重哈希：发送方 + 时间 + 正文
-func messageHash(m Message) string {
-	ts := m.Timestamp
-	if ts.IsZero() {
-		ts = time.Now()
-	}
+// messageHash 计算消息去重哈希：发送方 + 时间 + 正文。
+//
+// ts 必须由调用方传入（即最终写入 msg_time 的那个值）。早先这里在 ts 为零值时
+// 自己调 time.Now()，与 SaveMessages 里的 time.Now() 是两个不同时刻，导致
+// hash 每次都不一样、UNIQUE(contact_id, msg_hash) 去重彻底失效，且 hash 里的
+// 时间与库里的 msg_time 对不上。
+func messageHash(m Message, ts time.Time) string {
 	sum := md5.Sum([]byte(m.Sender + ":" + ts.Format(time.RFC3339) + ":" + m.Content))
 	return hex.EncodeToString(sum[:])
+}
+
+// parseMsgTime 解析库中存储的 msg_time（统一为 RFC3339）。
+// 解析失败时回落当前时间，但会打印告警：静默改写时间会让数据错乱无从排查。
+func parseMsgTime(raw string) time.Time {
+	if ts, err := time.Parse(time.RFC3339, raw); err == nil {
+		return ts
+	}
+	slog.Warn("msg_time 不是合法的 RFC3339，已回落为当前时间", "raw", raw)
+	return time.Now()
 }
 
 // SaveMessages 保存一批消息（INSERT OR IGNORE 去重）。
@@ -221,7 +284,7 @@ func SaveMessages(db *sql.DB, contactID int64, messages []Message) (int, error) 
 		res, err := db.Exec(
 			`INSERT OR IGNORE INTO messages (contact_id, sender, content, msg_hash, msg_time)
 			 VALUES (?, ?, ?, ?, ?)`,
-			contactID, m.Sender, content, messageHash(m), ts.Format(time.RFC3339))
+			contactID, m.Sender, content, messageHash(m, ts), ts.Format(time.RFC3339))
 		if err != nil {
 			return newCount, err
 		}
@@ -240,7 +303,11 @@ func SaveMessages(db *sql.DB, contactID int64, messages []Message) (int, error) 
 	return newCount, nil
 }
 
-// scanMessages 从 rows 扫描消息并按时间正序返回（传入的查询需按 id DESC）
+// scanMessages 从 rows 扫描消息并按时间正序（ASC）返回。
+//
+// 契约：传入的查询**必须**按 id DESC 排序，本函数负责把它反转成正序。
+// 所有调用方都要遵守这一点，否则净结果会变成倒序（GetAllMessages 曾经就是这样，
+// 用 ASC 查询再被这里反转，等于把最新在前的对话喂给了 LLM）。
 func scanMessages(rows *sql.Rows) ([]Message, error) {
 	defer rows.Close()
 	var reversed []Message
@@ -249,14 +316,10 @@ func scanMessages(rows *sql.Rows) ([]Message, error) {
 		if err := rows.Scan(&sender, &content, &msgTime); err != nil {
 			return nil, err
 		}
-		ts, err := time.Parse(time.RFC3339, msgTime)
-		if err != nil {
-			ts = time.Now()
-		}
 		reversed = append(reversed, Message{
 			Sender:    sender,
 			Content:   content,
-			Timestamp: ts,
+			Timestamp: parseMsgTime(msgTime),
 		})
 	}
 	if err := rows.Err(); err != nil {
@@ -285,14 +348,18 @@ func GetRecentMessages(db *sql.DB, contactID int64, limit int) ([]Message, error
 	return scanMessages(rows)
 }
 
-// GetAllMessages 取该联系人全部消息（按时间正序），供合并后重生成画像使用
+// GetAllMessages 取该联系人全部消息（按时间正序 ASC），供画像生成 / 合并后重生成使用。
+//
+// 注意查询必须是 id DESC：scanMessages 会无条件反转，ASC 查询 + 反转 = 倒序，
+// 这正是修复前的 bug（LLM 拿到的是最新在前的对话，画像质量受损，且与桌面端
+// 远程模式 doGetAllMessages 的正序结果方向相反）。
 func GetAllMessages(db *sql.DB, contactID int64) ([]Message, error) {
 	dbMu.Lock()
 	defer dbMu.Unlock()
 
 	rows, err := db.Query(
 		`SELECT sender, content, msg_time FROM messages
-		 WHERE contact_id = ? ORDER BY id ASC`,
+		 WHERE contact_id = ? ORDER BY id DESC`,
 		contactID)
 	if err != nil {
 		return nil, err
@@ -313,17 +380,13 @@ func GetMessagesPage(db *sql.DB, contactID int64, offset, limit int) ([]Message,
 		return nil, err
 	}
 	defer rows.Close()
-	var out []Message
+	out := []Message{} // 空结果也返回 [] 而非 nil（JSON null），前端才不会白屏
 	for rows.Next() {
 		var sender, content, msgTime string
 		if err := rows.Scan(&sender, &content, &msgTime); err != nil {
 			return nil, err
 		}
-		ts, err := time.Parse(time.RFC3339, msgTime)
-		if err != nil {
-			ts = time.Now()
-		}
-		out = append(out, Message{Sender: sender, Content: content, Timestamp: ts})
+		out = append(out, Message{Sender: sender, Content: content, Timestamp: parseMsgTime(msgTime)})
 	}
 	return out, rows.Err()
 }
@@ -366,7 +429,11 @@ func GetAllContacts(db *sql.DB, includeMerged bool) ([]Contact, error) {
 	if !includeMerged {
 		query += ` WHERE c.merged_into IS NULL`
 	}
-	query += ` ORDER BY c.last_updated DESC, c.id DESC`
+	// 用 strftime('%s', ...) 转成 epoch 再排序：last_updated 是 RFC3339 字符串，
+	// 直接按字典序比较只在所有记录时区偏移相同时才成立。一旦混入 +08:00 与 Z
+	// （例如库在容器里以 UTC 写过一段），字典序就会给出错误的先后关系。
+	// 无法解析/NULL 的值 strftime 返回 NULL，在 DESC 下排最后，与原 '' 行为一致。
+	query += ` ORDER BY strftime('%s', c.last_updated) DESC, c.id DESC`
 
 	rows, err := db.Query(query)
 	if err != nil {
@@ -374,7 +441,7 @@ func GetAllContacts(db *sql.DB, includeMerged bool) ([]Contact, error) {
 	}
 	defer rows.Close()
 
-	var out []Contact
+	out := []Contact{} // 空结果也返回 [] 而非 nil（JSON null），前端才不会白屏
 	for rows.Next() {
 		var c Contact
 		if err := rows.Scan(&c.ID, &c.Name, &c.Remark, &c.ProfileJSON,
@@ -404,7 +471,7 @@ func GetProfileHistory(db *sql.DB, contactID int64, limit int) ([]ProfileHistory
 	}
 	defer rows.Close()
 
-	var out []ProfileHistory
+	out := []ProfileHistory{} // 空结果也返回 [] 而非 nil（JSON null），前端才不会白屏
 	for rows.Next() {
 		var h ProfileHistory
 		if err := rows.Scan(&h.ID, &h.ContactID, &h.ProfileJSON,
@@ -460,12 +527,21 @@ func GetContactStats(db *sql.DB, contactID int64) (ContactStats, error) {
 
 	var s ContactStats
 	var first, last sql.NullString
+	// 首/末消息时间不能用 MIN/MAX(msg_time)：msg_time 是 RFC3339 字符串，
+	// MIN/MAX 走的是字典序，只在所有记录时区偏移一致时才等价于时间序。
+	// 改为按 strftime('%s', msg_time) 排序取端点，返回的仍是原始字符串。
 	err := db.QueryRow(
 		`SELECT COUNT(*),
 		        COALESCE(SUM(CASE WHEN sender='me' THEN 1 ELSE 0 END), 0),
 		        COALESCE(SUM(CASE WHEN sender='other' THEN 1 ELSE 0 END), 0),
-		        COALESCE(MIN(msg_time), ''), COALESCE(MAX(msg_time), '')
-		 FROM messages WHERE contact_id = ?`, contactID).
+		        COALESCE((SELECT msg_time FROM messages
+		                  WHERE contact_id = ? AND msg_time IS NOT NULL AND msg_time != ''
+		                  ORDER BY strftime('%s', msg_time) ASC, id ASC LIMIT 1), ''),
+		        COALESCE((SELECT msg_time FROM messages
+		                  WHERE contact_id = ? AND msg_time IS NOT NULL AND msg_time != ''
+		                  ORDER BY strftime('%s', msg_time) DESC, id DESC LIMIT 1), '')
+		 FROM messages WHERE contact_id = ?`,
+		contactID, contactID, contactID, contactID).
 		Scan(&s.Total, &s.Mine, &s.Other, &first, &last)
 	if err != nil {
 		return s, err

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"log/slog"
 	"regexp"
 	"strings"
 	"time"
@@ -56,8 +57,13 @@ func classifySender(name, myName string) string {
 	return "other"
 }
 
-// parseTime 解析消息时间，归一化中文「年月日」后按多种布局尝试，失败用当前时间
+// parseTime 解析消息时间，归一化中文「年月日」后按多种布局尝试。
+//
+// 解析失败时仍回落当前时间（保持导入流程不中断），但必须打印告警：
+// 静默回落会让消息时间整体错乱且无从排查——两个调用点都由正则筛过，
+// 走到这里说明是 timeLayouts 没覆盖的新格式，需要补布局而不是忽略。
 func parseTime(s string) time.Time {
+	raw := s
 	s = strings.TrimSpace(s)
 	s = strings.ReplaceAll(s, "年", "/")
 	s = strings.ReplaceAll(s, "月", "/")
@@ -74,6 +80,7 @@ func parseTime(s string) time.Time {
 			return ts
 		}
 	}
+	slog.Warn("无法解析消息时间，已回落为当前时间", "raw", raw, "normalized", s)
 	return time.Now()
 }
 

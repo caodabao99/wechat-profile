@@ -18,6 +18,7 @@
 - **昵称合并**：对方修改微信昵称后，手动关联新旧昵称，历史数据自动归位；支持撤销合并
 - **画像历史**：每次画像更新（自动/手动/合并）都会保留历史版本和变化说明，可随时查看和对比
 - **本地存储**：所有数据保存在本地 SQLite，不上传任何服务器（仅识别时发送给配置的 LLM）
+- **远程模式（可选）**：可改为连接 `wechat-profile-bot` 服务端，数据与 LLM 分析都在服务端，界面操作完全一致
 - **窗口置顶**：悬浮窗、结果窗、画像窗均置顶显示，不被微信等程序遮挡
 
 ## 下载与安装
@@ -41,6 +42,8 @@ rsrc -manifest app.manifest -o rsrc.syso
 go build -ldflags="-H windowsgui" -o wechat-profile.exe
 ```
 
+Linux/macOS 下交叉编译可直接执行 `./build.sh`，产物输出到 `dist/`。
+
 ## 配置说明
 
 首次运行会在 exe 同目录自动生成 `config.json`，文件内自带每项配置的注释说明：
@@ -48,6 +51,11 @@ go build -ldflags="-H windowsgui" -o wechat-profile.exe
 ```json
 {
   "myName": "你的微信昵称",
+  "remote": {
+    "enabled": false,
+    "apiURL": "",
+    "apiToken": ""
+  },
   "llm": {
     "apiKey": "sk-xxx",
     "baseURL": "https://api.deepseek.com",
@@ -64,12 +72,40 @@ go build -ldflags="-H windowsgui" -o wechat-profile.exe
 | 字段 | 含义 |
 |---|---|
 | `myName` | **你自己的微信昵称**，用于区分复制记录里哪条是你发的，务必填对 |
-| `llm.apiKey` | 大模型 API Key，默认 DeepSeek，也可换成任意 OpenAI 兼容接口 |
+| `remote.enabled` | 是否启用远程模式，默认 `false`（本地 SQLite）。详见下方「远程模式」 |
+| `remote.apiURL` | bot 服务端地址，如 `http://192.168.1.100:17965`。留空则强制走本地模式 |
+| `remote.apiToken` | 认证 Token，必须与 bot 端 `config.json` 的 `apiToken` 一致 |
+| `llm.apiKey` | 大模型 API Key，默认 DeepSeek，也可换成任意 OpenAI 兼容接口。**远程模式下不需要填** |
 | `llm.baseURL` | 接口地址，不带末尾斜杠 |
 | `llm.model` | 模型名 |
 | `llm.disableThinking` | 是否关闭模型的推理思考模式，默认 `true`。本程序不需要推理，开着只会拖慢响应、多耗 token。deepseek-v4-flash、qwen3.8-flash 等默认开思考的模型必须保持 `true`；不支持的接口会自动忽略 |
 | `profile.coldStartCount` | 累计多少条**对方**消息后首次生成画像，默认 20 |
 | `profile.updateInterval` | 之后每新增多少条对方消息更新一次画像，默认 10 |
+
+### 远程模式（配合 bot 服务端）
+
+默认是**本地模式**：数据和画像都存在桌面端同目录的 `wechat_profile.db`，LLM 调用由桌面端直接发起。
+
+如果你已经在服务器上部署了配套的 `wechat-profile-bot` 服务端（微信机器人版，数据存服务端 SQLite），
+桌面端可以切换成**远程模式**复用它：界面和操作完全不变，但所有数据和 LLM 分析都走服务端的 HTTP API。
+
+配置方式（`config.json`）：
+
+```json
+{
+  "myName": "你的微信昵称",
+  "remote": {
+    "enabled": true,
+    "apiURL": "http://192.168.1.100:17965",
+    "apiToken": "与服务端 config.json 里的 apiToken 一致"
+  }
+}
+```
+
+- 启动时会先 ping 服务端，连不上会弹窗提示并退出，不会静默退回本地库。
+- 远程模式下**不需要** `llm.apiKey`（模型调用在服务端完成），也不会生成本地 `wechat_profile.db`。
+- `apiURL` 可省略 `http://` 前缀；未写端口时默认按 17965 处理（服务端 `apiPort` 可改）。
+- 服务端如果配了 `apiWhitelist`（IP 白名单），你的公网/内网 IP 必须在名单内，否则一律返回 403。
 
 ## 使用方法
 
@@ -115,11 +151,22 @@ go build -ldflags="-H windowsgui" -o wechat-profile.exe
 
 `disableThinking` 默认 `true` 关闭推理思考模式（本程序不需要推理，开着只会变慢、多耗 token）。对于默认开启思考的模型（如 deepseek-v4-flash、qwen3.8-flash）必须保持 `true`；不支持的接口会自动忽略该参数。
 
+## 备份与恢复（换电脑迁移）
+
+画像窗口左下角提供「备份…」「恢复…」按钮：
+
+- **备份…**：选择保存位置，导出 `wechat-profile-backup-日期.zip`，包含全部联系人、消息、画像历史、合并记录和 `config.json`
+- **恢复…**：在新电脑装好程序后，选择旧电脑导出的 zip 即可整体恢复；恢复前会自动在程序目录留一份「恢复前自动备份」，恢复配置文件后重启程序生效
+- 远程模式下这两个按钮自动操作的是 bot 服务端数据（同时包含服务端配置与凭据），换服务器时同样适用
+
+> 备份文件包含模型 API Key 等敏感配置，请妥善保管。
+
 ## 数据与隐私
 
 - 全部消息、画像存放在程序目录的 `wechat_profile.db`（SQLite），不会被上传到任何服务器。
 - 但**每次点击「识别」，本次复制的对话文本会发送给 `config.json` 中配置的大模型接口**，请知悉并自行评估隐私风险。
 - 删除 `wechat_profile.db` 即可清空所有积累数据。
+- **远程模式例外**：开启 `remote.enabled` 后，数据存放在 bot 服务端的 SQLite 中，对话文本由服务端转发给服务端配置的大模型接口，本地不再落库。
 
 ## 注意事项
 
@@ -130,9 +177,16 @@ go build -ldflags="-H windowsgui" -o wechat-profile.exe
 
 ## 更新日志
 
+### v1.2（2026-10-02）
+
+**新功能**
+- 数据备份/恢复：画像窗口左下角「备份…/恢复…」一键导出/导入 zip，换电脑直接迁移；远程模式下同样支持备份/恢复 bot 服务端数据
+- 恢复采用整库快照校验 + 事务替换，恢复前自动留存一份「恢复前自动备份」
+
 ### v1.1（2026-10-01）
 
 **新功能**
+- 远程模式：`remote.enabled=true` 时数据层走 `wechat-profile-bot` 服务端 HTTP API，LLM 分析在服务端完成
 - 联系人备注：显示「备注（昵称）」，不影响识别匹配
 - 手动补充画像：随时提交生日、性别等信息，AI 合并到画像
 - 昵称合并与撤销：对方改昵称后手动关联，支持精确撤销
@@ -150,7 +204,10 @@ go build -ldflags="-H windowsgui" -o wechat-profile.exe
 - 时间显示错误（UTC 与北京时间混用导致偏差 8 小时）
 - 合并联系人卡死（数据库锁重入）
 - 撤销合并 UNIQUE 约束冲突
+- 撤销合并后别名未回收、源联系人卡在临时名，导致按昵称查找命中错误联系人
+- 删除曾参与合并的联系人时残留合并日志
 - 补充画像时模型返回对象格式导致整个操作失败
+- `build.sh` 在仓库无 `config.json`（已 gitignore）时中断
 
 ### v1.0（2026-09-30）
 
