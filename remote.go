@@ -341,11 +341,26 @@ func (c *RemoteClient) backupHTTPClient() *http.Client {
 	return &http.Client{Timeout: 30 * time.Minute}
 }
 
-// DownloadBackup 从服务端下载备份 zip，返回文件内容与建议文件名
-func (c *RemoteClient) DownloadBackup() ([]byte, string, error) {
-	req, err := http.NewRequest(http.MethodGet, c.baseURL+"/api/backup/export", nil)
-	if err != nil {
-		return nil, "", err
+// DownloadBackup 从服务端下载备份 zip，返回文件内容与建议文件名。
+//
+// password 非空时用 POST 带口令，服务端会把 zip 内的密钥文件加密后再打包；
+// 留空则走 GET，得到明文备份（与旧版服务端行为一致）。
+// 口令放请求体而不是查询串，避免落进服务端访问日志和浏览器历史。
+func (c *RemoteClient) DownloadBackup(password string) ([]byte, string, error) {
+	var req *http.Request
+	var err error
+	if password != "" {
+		body, _ := json.Marshal(map[string]string{"password": password})
+		req, err = http.NewRequest(http.MethodPost, c.baseURL+"/api/backup/export", bytes.NewReader(body))
+		if err != nil {
+			return nil, "", err
+		}
+		req.Header.Set("Content-Type", "application/json")
+	} else {
+		req, err = http.NewRequest(http.MethodGet, c.baseURL+"/api/backup/export", nil)
+		if err != nil {
+			return nil, "", err
+		}
 	}
 	if c.token != "" {
 		req.Header.Set("Authorization", "Bearer "+c.token)
@@ -379,8 +394,9 @@ func (c *RemoteClient) DownloadBackup() ([]byte, string, error) {
 	return data, name, nil
 }
 
-// UploadBackup 把本地备份 zip 上传到服务端恢复
-func (c *RemoteClient) UploadBackup(zipPath string) (*BackupRestoreJSON, error) {
+// UploadBackup 把本地备份 zip 上传到服务端恢复。
+// password 用于解密 zip 内被加密的密钥文件；备份未加密时传空串。
+func (c *RemoteClient) UploadBackup(zipPath, password string) (*BackupRestoreJSON, error) {
 	f, err := os.Open(zipPath)
 	if err != nil {
 		return nil, err
@@ -389,6 +405,13 @@ func (c *RemoteClient) UploadBackup(zipPath string) (*BackupRestoreJSON, error) 
 
 	var buf bytes.Buffer
 	mw := multipart.NewWriter(&buf)
+	// 密码字段放在文件之前：文件可能上百 MB，会被落到临时文件，
+	// 而小字段留在内存里，服务端 ParseMultipartForm 后能直接取到。
+	if password != "" {
+		if err := mw.WriteField("password", password); err != nil {
+			return nil, err
+		}
+	}
 	part, err := mw.CreateFormFile("file", filepath.Base(zipPath))
 	if err != nil {
 		return nil, err

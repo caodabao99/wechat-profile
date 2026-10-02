@@ -1006,17 +1006,29 @@ func ShowProfileWindow(targetContactID int64) {
 													if !strings.HasSuffix(strings.ToLower(dest), ".zip") {
 														dest += ".zip"
 													}
+													// 可选口令：填了就把 zip 里的密钥文件加密
+													pwd, ok := promptBackupPassword("设置备份密码（可留空）",
+														"· 填了密码：配置里的模型 API Key 会用 AES-256 加密后放进 zip（文件名带 .enc），导入时需填同一密码\n"+
+															"· 留空：和以前一样明文保存，任何机器都能直接导入\n"+
+															"· 聊天数据始终是明文，zip 也仍是标准格式，可用解压软件打开查看\n"+
+															"· 密码程序不会保存，忘了就再也解不开被加密的文件",
+														"开始备份")
+													if !ok {
+														return
+													}
 													go func() {
-														err := doExportBackup(dest)
+														err := doExportBackup(dest, pwd)
 														dlg.Synchronize(func() {
 															if err != nil {
 																walk.MsgBox(dlg, "备份失败", err.Error(), walk.MsgBoxIconError)
 																return
 															}
-															walk.MsgBox(dlg, "备份完成",
-																"已导出到：\n"+dest+
-																	"\n\n备份含全部聊天画像数据和配置（模型 Key），请妥善保管，换电脑时在新机导入即可。",
-																walk.MsgBoxIconInformation)
+															msg := "已导出到：\n" + dest +
+																"\n\n备份含全部聊天画像数据和配置（模型 Key），请妥善保管，换电脑时在新机导入即可。"
+															if pwd != "" {
+																msg += "\n\n本次已用密码加密配置文件，导入时必须填写同一密码。"
+															}
+															walk.MsgBox(dlg, "备份完成", msg, walk.MsgBoxIconInformation)
 														})
 													}()
 												},
@@ -1038,15 +1050,36 @@ func ShowProfileWindow(targetContactID int64) {
 														return
 													}
 													src := fd.FilePath
+													// 备份里的密钥文件若是加密的，必须先拿到密码才谈得上恢复
+													var pwd string
+													if BackupNeedsPassword(src) {
+														p, ok := promptBackupPassword("输入备份密码",
+															"这份备份导出时对密钥文件（模型 API Key 等）做了加密，请输入当时设置的密码。\n\n"+
+																"· 密码不对会直接中止恢复，现有数据不会受影响\n"+
+																"· 只想恢复聊天数据、不需要密钥文件时，也可以先取消，把 zip 里的 .enc 文件删掉再导入",
+															"继续")
+														if !ok {
+															return
+														}
+														if p == "" {
+															walk.MsgBox(dlg, "需要密码", "这份备份已加密，必须填写导出时设置的密码。", walk.MsgBoxIconWarning)
+															return
+														}
+														pwd = p
+													}
+													extra := ""
+													if pwd != "" {
+														extra = "\n· 本次将用你输入的密码解开备份中的密钥文件"
+													}
 													if walk.MsgBox(dlg, "从备份恢复",
 														"将用备份文件「"+filepath.Base(src)+"」整体替换当前所有联系人、消息和画像数据。\n\n"+
 															"· 恢复前会自动在程序目录留一份「恢复前自动备份」\n"+
-															"· 配置文件恢复后需重启程序生效\n\n确定继续吗？",
+															"· 配置文件恢复后需重启程序生效"+extra+"\n\n确定继续吗？",
 														walk.MsgBoxYesNo|walk.MsgBoxIconWarning) != walk.DlgCmdYes {
 														return
 													}
 													go func() {
-														summary, err := doImportBackup(src)
+														summary, err := doImportBackup(src, pwd)
 														dlg.Synchronize(func() {
 															if err != nil {
 																walk.MsgBox(dlg, "恢复失败", err.Error(), walk.MsgBoxIconError)

@@ -25,7 +25,9 @@
 
 ### 方式一：直接下载（推荐）
 
-去 [Releases](https://github.com/caodabao99/wechat-profile/releases) 页面下载最新版 `wechat-profile-v2.0.zip`，解压到任意目录。
+去 [Releases](https://github.com/caodabao99/wechat-profile/releases) 页面下载最新版 `wechat-profile-v2.1.zip`，解压到任意目录。
+
+> 同一个 Release 页面还附带服务端包 `wechat-profile-bot-v2.1.zip`（用「远程模式」时才需要），服务端的 Linux/Windows/Docker 部署说明见 [wechat-profile-bot](https://github.com/caodabao99/wechat-profile-bot)。
 
 ### 方式二：自行编译
 
@@ -43,6 +45,30 @@ go build -ldflags="-H windowsgui" -o wechat-profile.exe
 ```
 
 Linux/macOS 下交叉编译可直接执行 `./build.sh`，产物输出到 `dist/`。
+
+### 安装位置与开机自启（Windows）
+
+**绿色免安装**：解压到任意目录双击 `wechat-profile.exe` 即可运行，不写注册表、不需要安装程序。
+
+但要注意**程序的所有数据都放在 exe 同目录**（按 exe 的真实位置定位，与从哪个目录启动无关）：
+
+| 文件 | 说明 |
+|------|------|
+| `wechat_profile.db` | SQLite 数据库，全部联系人/消息/画像 |
+| `config.json` | 配置，含模型 API Key（首次运行自动生成） |
+| `wechat-profile.log` | 运行日志，程序闪退或行为异常时先看这个 |
+| `clipboard_debug.txt` | 粘贴失败时的剪贴板调试转储（可删） |
+
+所以：
+
+- **不要放在 `C:\Program Files` 这类需要管理员权限的目录**，否则程序写不了数据库和日志。建议放 `D:\wechat-profile\` 或 `%LOCALAPPDATA%\wechat-profile\`
+- **升级版本时只替换 exe**，同目录的数据文件会继续沿用；换电脑时用「备份…」导出 zip 再在新机「恢复…」
+- 建桌面快捷方式随意，不影响数据位置
+
+**开机自启**（可选，本程序是手动导入聊天记录的工具，通常不需要常驻）：
+
+- 简单做法：`Win+R` 输入 `shell:startup` 回车，把 `wechat-profile.exe` 的快捷方式拖进去
+- 需要以管理员权限运行、或在未登录时启动：用「任务计划程序」→ 创建任务 → 触发器选「登录时」→ 操作指向 exe 完整路径
 
 ## 配置说明
 
@@ -106,6 +132,8 @@ Linux/macOS 下交叉编译可直接执行 `./build.sh`，产物输出到 `dist/
 - 远程模式下**不需要** `llm.apiKey`（模型调用在服务端完成），也不会生成本地 `wechat_profile.db`。
 - `apiURL` 可省略 `http://` 前缀；未写端口时默认按 17965 处理（服务端 `apiPort` 可改）。
 - 服务端如果配了 `apiWhitelist`（IP 白名单），你的公网/内网 IP 必须在名单内，否则一律返回 403。
+- 服务端对**网页登录**失败会按 IP 计数，同一 IP 累计失败 10 次即永久封禁（所有请求 403）。桌面端走 `apiToken` 直连，token 配错只记审计日志、**不计入封禁**，不会把自己封死；但如果你所在 IP 因为网页端爆破被封了，需要在服务器上执行 `wechat-profile-bot --unban <ip>` 解封并重启服务。
+- 服务端 `/api/ingest`（聊天记录识别）限流为每 IP 每分钟 120 次，超出返回 429，正常使用碰不到。
 
 ## 使用方法
 
@@ -155,11 +183,23 @@ Linux/macOS 下交叉编译可直接执行 `./build.sh`，产物输出到 `dist/
 
 画像窗口左下角提供「备份…」「恢复…」按钮：
 
-- **备份…**：选择保存位置，导出 `wechat-profile-backup-日期.zip`，包含全部联系人、消息、画像历史、合并记录和 `config.json`
+- **备份…**：选择保存位置后会弹出一个「设置备份密码」窗口（可留空），然后导出 `wechat-profile-backup-日期.zip`，包含全部联系人、消息、画像历史、合并记录和 `config.json`
 - **恢复…**：在新电脑装好程序后，选择旧电脑导出的 zip 即可整体恢复；恢复前会自动在程序目录留一份「恢复前自动备份」，恢复配置文件后重启程序生效
 - 远程模式下这两个按钮自动操作的是 bot 服务端数据（同时包含服务端配置与凭据），换服务器时同样适用
 
-> 备份文件包含模型 API Key 等敏感配置，请妥善保管。
+### 备份密码（可选加密）
+
+导出时填了密码，zip 里的**密钥文件**就会被加密：
+
+- 加密的只有 `config.json`（模型 API Key）；远程模式下是服务端的 `config.json`、`ilink_credentials.json`、`totp_secret.json`
+- 聊天数据库 `data.db` 和 `MANIFEST.json` **始终是明文**，zip 也仍是标准格式，可以用解压软件直接打开查看
+- 加密方式为 PBKDF2-HMAC-SHA256（120000 次迭代）派生密钥 + AES-256-GCM，加密后的文件在 zip 内改名为 `原名.enc`
+- 留空则和以前完全一样，明文保存，任何机器都能直接导入
+- 恢复时程序会自动识别备份是否加密；加密的会先弹窗要求输入密码，**密码不对会直接中止恢复，现有数据不受影响**
+
+> **密码不会被程序保存在任何地方**，忘了就再也解不开那几个 `.enc` 文件（聊天记录不受影响，仍可正常恢复）。
+
+> 备份文件即使填了密码，聊天数据库仍是明文，请妥善保管。
 
 ## 数据与隐私
 
@@ -177,7 +217,20 @@ Linux/macOS 下交叉编译可直接执行 `./build.sh`，产物输出到 `dist/
 
 ## 更新日志
 
-### v1.2（2026-10-02）
+### v2.1（2026-10-02）
+
+**新功能**
+- 备份密码：导出 zip 时可填一个口令，`config.json`（含 apiKey、微信凭据）会用 PBKDF2-SHA256（12 万次迭代）+ AES-256-GCM 加密成 `config.json.enc`；留空则与旧版一致。恢复时自动识别加密文件，密码错误会中止且不破坏现有数据
+
+**安全**
+- 服务端（bot）新增登录失败 IP 永久封禁、`/api/ingest` 限流（每 IP 每分钟 120 次）、安全响应头、HTTP 超时、Docker 非 root 运行，详见 [wechat-profile-bot](https://github.com/caodabao99/wechat-profile-bot)
+- 桌面端用 `apiToken` 直连服务端，token 配错只记审计日志、不计入封禁次数，不会把自己封死
+
+**文档**
+- 新增「安装位置与开机自启（Windows）」：说明数据文件都在 exe 同目录、升级只换 exe、开机自启的两种方式
+- 新增「备份密码」章节
+
+### v1.2（2026-10-02，发布为 v2.0）
 
 **新功能**
 - 数据备份/恢复：画像窗口左下角「备份…/恢复…」一键导出/导入 zip，换电脑直接迁移；远程模式下同样支持备份/恢复 bot 服务端数据
