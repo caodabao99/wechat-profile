@@ -22,6 +22,7 @@ func promptBackupPassword(title, hint, okText string) (string, bool) {
 	var pwdLE *walk.LineEdit
 	var showCB *walk.CheckBox
 	accepted := false
+	var password string
 
 	if err := (dl.Dialog{
 		AssignTo: &dlg,
@@ -46,6 +47,7 @@ func promptBackupPassword(title, hint, okText string) (string, bool) {
 						Text:    okText,
 						MinSize: dl.Size{Width: 80, Height: 32},
 						OnClicked: func() {
+							password = strings.TrimSpace(pwdLE.Text())
 							accepted = true
 							dlg.Accept()
 						},
@@ -70,5 +72,5 @@ func promptBackupPassword(title, hint, okText string) (string, bool) {
 	if !accepted {
 		return "", false
 	}
-	return strings.TrimSpace(pwdLE.Text()), true
+	return password, true
 }

@@ -247,6 +247,10 @@ func onIdentifyRemote(text string, finalStatus *string) {
 		return
 	}
 
+	if result.IntentError != "" {
+		ResetClipboardHash()
+	}
+
 	if result.ViaAlias {
 		*finalStatus = "旧昵称已归位"
 	}
@@ -328,6 +332,9 @@ func onIdentifyLocal(text string, finalStatus *string) {
 	}
 
 	result, analysisErr := doAnalyzeIntent(contactID, latestOther)
+	if analysisErr != nil {
+		ResetClipboardHash()
+	}
 	mainWindow.Synchronize(func() {
 		ShowResultWindow(contactID, contactName, newCount, viaAlias, result, analysisErr)
 	})
@@ -381,7 +388,6 @@ func confidenceText(v int) string {
 func ShowResultWindow(contactID int64, contactName string, newCount int, viaAlias bool, result map[string]interface{}, analysisErr error) {
 	var dlg *walk.Dialog
 	var summaryLabel *walk.Label
-	var suggestionTE *walk.TextEdit
 	var confidencePB *walk.ProgressBar
 	var confidenceLabel *walk.Label
 
@@ -428,13 +434,19 @@ func ShowResultWindow(contactID int64, contactName string, newCount int, viaAlia
 			{"潜在意图", "intent"},
 			{"情绪状态", "emotion"},
 			{"潜台词", "subtext"},
-			{"建议回复", "suggested_reply"},
+		}
+		for i, reply := range suggestedReplies(result) {
+			key := fmt.Sprintf("suggested_reply_%d", i)
+			result[key] = reply
+			cardKeys = append(cardKeys, struct{ title, key string }{fmt.Sprintf("建议回复 %d", i+1), key})
 		}
 
 		for _, c := range cardKeys {
+			var suggestionTE *walk.TextEdit
 			content := fieldString(result, c.key)
-			if c.key == "suggested_reply" {
-				children = append(children,
+			if strings.HasPrefix(c.key, "suggested_reply_") {
+				controls := rewriteControls(contactID, &suggestionTE)
+				children = append(children, controls,
 					dl.GroupBox{
 						Title:  c.title,
 						Layout: dl.VBox{MarginsZero: true, Spacing: 4},
@@ -525,8 +537,9 @@ func ShowResultWindow(contactID int64, contactName string, newCount int, viaAlia
 		AssignTo: &dlg,
 		Title:    "意图分析结果",
 		MinSize:  dl.Size{Width: 520, Height: 480},
+		Size:     dl.Size{Width: 560, Height: 650},
 		Layout:   dl.VBox{Spacing: 8},
-		Children: children,
+		Children: []dl.Widget{dl.ScrollView{Layout: dl.VBox{Spacing: 8}, Children: children}},
 	}).Create(mainWindow); err != nil {
 		showError("创建结果窗口失败: " + err.Error())
 		return
@@ -757,8 +770,33 @@ func ShowProfileWindow(targetContactID int64) {
 		historyDetailTE.SetText(profileFullText(&p))
 	}
 
+	clearContact := func() {
+		currentID = 0
+		currentContact = nil
+		offset = 0
+		summaryLabel.SetText("请选择左侧联系人")
+		renderProfile()
+		mm.set(nil)
+		mm.PublishRowsReset()
+		msgDetailTE.SetText("")
+		hm.set(nil)
+		hm.PublishItemsReset()
+		historyDetailTE.SetText("")
+		pageLabel.SetText("")
+		prevBtn.SetEnabled(false)
+		nextBtn.SetEnabled(false)
+		for _, lb := range []*walk.Label{statTotalVal, statMineVal, statOtherVal,
+			statFirstVal, statLastVal, statProfileVal, statAliasVal} {
+			lb.SetText("-")
+		}
+	}
+
 	// loadContact 刷新右侧全部页签
 	loadContact := func(id int64) {
+		clearContact()
+		if id <= 0 {
+			return
+		}
 		currentID = id
 		contact, err := fetchContactByID(id)
 		if err != nil {
@@ -875,6 +913,18 @@ func ShowProfileWindow(targetContactID int64) {
 									dl.Composite{
 										Layout: dl.HBox{MarginsZero: true, Spacing: 4},
 										Children: []dl.Widget{
+											dl.PushButton{Text: "回复前帮我看看", OnClicked: func() { showDraftDialog(currentID) }},
+											dl.PushButton{Text: "画像变化", OnClicked: func() { showChangesDialog(currentID) }},
+											dl.PushButton{
+												Text: "编辑画像…",
+												OnClicked: func() {
+													idx := contactsTV.CurrentIndex()
+													if idx < 0 || idx >= len(cm.items) {
+														return
+													}
+													showEditProfileDialog(cm.items[idx].ID, func() { refreshContacts(); loadContact(currentID) })
+												},
+											},
 											dl.PushButton{
 												Text:    "补充画像…",
 												MinSize: dl.Size{Width: 70, Height: 28},
@@ -965,8 +1015,7 @@ func ShowProfileWindow(targetContactID int64) {
 																return
 															}
 															// 删除后右栏还显示着被删联系人的画像，清掉避免误导
-															currentID = 0
-															summaryLabel.SetText("请选择左侧联系人")
+															clearContact()
 															refreshContacts()
 														},
 													},
@@ -1095,8 +1144,7 @@ func ShowProfileWindow(targetContactID int64) {
 																msg += "\n\n数据在服务端已即时生效；服务端配置/登录凭据需重启服务"
 															}
 															walk.MsgBox(dlg, "恢复完成", msg, walk.MsgBoxIconInformation)
-															currentID = 0
-															summaryLabel.SetText("请选择左侧联系人")
+															clearContact()
 															refreshContacts()
 														})
 													}()
@@ -1254,6 +1302,7 @@ func ShowProfileWindow(targetContactID int64) {
 	contactsTV.CurrentIndexChanged().Attach(func() {
 		idx := contactsTV.CurrentIndex()
 		if idx < 0 || idx >= len(cm.items) {
+			clearContact()
 			return
 		}
 		loadContact(cm.items[idx].ID)
@@ -1300,6 +1349,9 @@ func ShowProfileWindow(targetContactID int64) {
 		}
 		cm.set(shown)
 		cm.PublishRowsReset()
+		if idx := contactsTV.CurrentIndex(); idx < 0 || idx >= len(cm.items) {
+			clearContact()
+		}
 	}
 	searchLE.TextChanged().Attach(applyFilter)
 
@@ -1319,6 +1371,8 @@ func ShowProfileWindow(targetContactID int64) {
 	}
 	if selectIdx >= 0 && selectIdx < len(cm.items) {
 		contactsTV.SetCurrentIndex(selectIdx)
+	} else {
+		clearContact()
 	}
 
 	dlg.Run()

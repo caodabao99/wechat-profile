@@ -15,6 +15,15 @@ import (
 // dbMu 串行化所有数据库操作（配合 WAL，避免 database is locked）
 var dbMu sync.Mutex
 
+// profileEpoch is guarded by dbMu; it is never restored from a backup.
+var profileEpoch uint64
+
+func currentProfileEpoch() uint64 {
+	dbMu.Lock()
+	defer dbMu.Unlock()
+	return profileEpoch
+}
+
 // ProfileHistory 画像变更历史
 type ProfileHistory struct {
 	ID            int64
@@ -240,6 +249,25 @@ func migrate(db *sql.DB) error {
 			return err
 		}
 	}
+	if version < 6 {
+		tx, err := db.Begin()
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+		for _, stmt := range []string{
+			`ALTER TABLE merge_log ADD COLUMN deleted_messages TEXT DEFAULT '[]'`,
+			`ALTER TABLE merge_log ADD COLUMN target_profile TEXT DEFAULT ''`,
+			`PRAGMA user_version = 6`,
+		} {
+			if _, err := tx.Exec(stmt); err != nil {
+				return err
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -317,9 +345,11 @@ func scanMessages(rows *sql.Rows) ([]Message, error) {
 			return nil, err
 		}
 		reversed = append(reversed, Message{
-			Sender:    sender,
-			Content:   content,
-			Timestamp: parseMsgTime(msgTime),
+			Sender:          sender,
+			Content:         content,
+			Timestamp:       parseMsgTime(msgTime),
+			profileEpoch:    profileEpoch,
+			profileSnapshot: true,
 		})
 	}
 	if err := rows.Err(); err != nil {
@@ -485,24 +515,43 @@ func GetProfileHistory(db *sql.DB, contactID int64, limit int) ([]ProfileHistory
 
 // SaveProfile 持久化最新画像并写入一条历史记录
 func SaveProfile(db *sql.DB, contactID int64, profileJSON, summary, changeSummary string) error {
+	return saveProfileAtEpoch(db, contactID, profileJSON, summary, changeSummary, currentProfileEpoch())
+}
+
+func saveProfileAtEpoch(db *sql.DB, contactID int64, profileJSON, summary, changeSummary string, epoch uint64) error {
 	dbMu.Lock()
 	defer dbMu.Unlock()
+	if epoch != profileEpoch {
+		return ErrProfileStale
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var merged sql.NullInt64
+	if err := tx.QueryRow(`SELECT merged_into FROM contacts WHERE id = ?`, contactID).Scan(&merged); err != nil {
+		return err
+	}
+	if merged.Valid {
+		return ErrProfileStale
+	}
 
 	// 统一用本地时间（不用 SQLite CURRENT_TIMESTAMP，避免存成 UTC 慢 8 小时）
 	// 同时记录本次生成画像时的对方消息数，作为下次周期更新的基线
 	now := time.Now().Format(time.RFC3339)
-	if _, err := db.Exec(`UPDATE contacts
+	if _, err := tx.Exec(`UPDATE contacts
 		 SET profile_json = ?, profile_summary = ?, last_updated = ?,
 		     profile_msg_count = other_msg_count
 		 WHERE id = ?`, profileJSON, summary, now, contactID); err != nil {
 		return err
 	}
-	if _, err := db.Exec(
+	if _, err := tx.Exec(
 		`INSERT INTO profile_history (contact_id, profile_json, change_summary, created_at)
 		 VALUES (?, ?, ?, ?)`, contactID, profileJSON, changeSummary, now); err != nil {
 		return err
 	}
-	return nil
+	return tx.Commit()
 }
 
 // saveProfileHistory 只写一条历史记录（不改 contacts 当前画像），用于记录生成失败等事件

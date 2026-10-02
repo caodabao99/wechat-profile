@@ -23,6 +23,7 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -38,7 +39,7 @@ const (
 	backupFormatVersion = 1
 	backupDBEntry       = "data.db"
 	backupManifestName  = "MANIFEST.json"
-	backupCurrentDBVer  = 5 // 当前程序支持的最高 SQLite user_version
+	backupCurrentDBVer  = 6 // 当前程序支持的最高 SQLite user_version
 	backupMaxUnzipBytes = int64(512 << 20)
 	backupMaxEntries    = 20
 )
@@ -259,6 +260,12 @@ func BuildBackupZip(db *sql.DB, sidecarDir string, sidecarFiles []string) (strin
 // BuildBackupZipWithPassword 同 BuildBackupZip，password 非空时把旁路文件加密后
 // 以 <原名>.enc 放入 zip（data.db 与 MANIFEST.json 始终明文）。
 func BuildBackupZipWithPassword(db *sql.DB, sidecarDir string, sidecarFiles []string, password string) (string, func(), error) {
+	dbMu.Lock()
+	defer dbMu.Unlock()
+	return buildBackupZipLocked(db, sidecarDir, sidecarFiles, password)
+}
+
+func buildBackupZipLocked(db *sql.DB, sidecarDir string, sidecarFiles []string, password string) (string, func(), error) {
 	tmpDir, err := os.MkdirTemp("", "wp-backup-*")
 	if err != nil {
 		return "", nil, err
@@ -442,7 +449,7 @@ func RestoreBackupZip(db *sql.DB, zipPath, sidecarDir string, makeSafety bool) (
 
 // RestoreBackupZipWithPassword 同 RestoreBackupZip，password 用于解密 zip 内的 .enc 旁路文件。
 // 备份未加密时传空串即可；备份加密了却没传密码会明确报错，不会静默丢文件。
-func RestoreBackupZipWithPassword(db *sql.DB, zipPath, sidecarDir string, makeSafety bool, password string) (*BackupSummary, error) {
+func RestoreBackupZipWithPassword(db *sql.DB, zipPath, sidecarDir string, makeSafety bool, password string) (result *BackupSummary, retErr error) {
 	snapPath, _, sidecars, err := extractBackupZip(zipPath)
 	if err != nil {
 		return nil, err
@@ -491,14 +498,30 @@ func RestoreBackupZipWithPassword(db *sql.DB, zipPath, sidecarDir string, makeSa
 		return nil, err
 	}
 
+	dbMu.Lock()
+	defer dbMu.Unlock()
+	files, err := stageRestoreSidecars(sidecars, sidecarDir)
+	if err != nil {
+		return nil, err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			retErr = errors.Join(retErr, rollbackRestoreSidecars(files))
+		}
+		for _, f := range files {
+			os.Remove(f.staged)
+		}
+	}()
+
 	// 2. 恢复前自动备份（防误操作，长期保留）
 	summary := &BackupSummary{Files: []string{}}
 	if makeSafety {
-		safetyPath, safetyCleanup, err := BuildBackupZip(db, sidecarDir, nil)
+		safetyPath, safetyCleanup, err := buildBackupZipLocked(db, sidecarDir, []string{"config.json", "ilink_credentials.json", "totp_secret.json"}, "")
 		if err != nil {
 			return nil, fmt.Errorf("生成恢复前自动备份失败: %w", err)
 		}
-		dest := filepath.Join(sidecarDir, "auto-backup-pre-restore-"+time.Now().Format("20060102-150405")+".zip")
+		dest := filepath.Join(sidecarDir, "auto-backup-pre-restore-"+time.Now().Format("20060102-150405.000000000")+".zip")
 		if err := copyFile(safetyPath, dest); err != nil {
 			safetyCleanup()
 			return nil, err
@@ -515,16 +538,22 @@ func RestoreBackupZipWithPassword(db *sql.DB, zipPath, sidecarDir string, makeSa
 	}
 	defer conn.Close()
 
-	dbMu.Lock()
-	defer dbMu.Unlock()
-
 	exec := func(q string) error {
 		_, err := conn.ExecContext(ctx, q)
 		return err
 	}
+	var foreignKeys int
+	if err := conn.QueryRowContext(ctx, `PRAGMA foreign_keys`).Scan(&foreignKeys); err != nil {
+		return nil, err
+	}
 	if err := exec(`PRAGMA foreign_keys=OFF`); err != nil {
 		return nil, err
 	}
+	defer func() {
+		if err := exec(fmt.Sprintf(`PRAGMA foreign_keys=%d`, foreignKeys)); err != nil {
+			slog.Error("恢复连接外键设置失败", "err", err)
+		}
+	}()
 	if err := exec(`ATTACH DATABASE ` + quoteSQLString(snapPath) + ` AS bak`); err != nil {
 		return nil, fmt.Errorf("挂载备份数据库失败: %w", err)
 	}
@@ -585,15 +614,23 @@ func RestoreBackupZipWithPassword(db *sql.DB, zipPath, sidecarDir string, makeSa
 		}
 	}
 
+	for _, f := range files {
+		if f.existed {
+			if err := os.Rename(f.dest, f.backup); err != nil {
+				return nil, fmt.Errorf("备份旧旁路文件失败: %w", err)
+			}
+			f.saved = true
+		}
+		if err := restoreRename(f.staged, f.dest); err != nil {
+			return nil, fmt.Errorf("安装旁路文件失败: %w", err)
+		}
+		f.installed = true
+	}
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
-	if err := exec(`DETACH DATABASE bak`); err != nil {
-		return nil, err
-	}
-	if err := exec(`PRAGMA foreign_keys=ON`); err != nil {
-		return nil, err
-	}
+	committed = true
+	profileEpoch++
 
 	summary.Contacts = counts["contacts"]
 	summary.Aliases = counts["contact_aliases"]
@@ -601,36 +638,85 @@ func RestoreBackupZipWithPassword(db *sql.DB, zipPath, sidecarDir string, makeSa
 	summary.Histories = counts["profile_history"]
 	summary.MergeLogs = counts["merge_log"]
 
-	// 4. 旁路文件落盘（旧文件先改名 .bak-时间戳），这些文件重启后才生效
-	allowed := map[string]bool{
-		"config.json":            true,
-		"ilink_credentials.json": true,
-		"totp_secret.json":       true,
-	}
-	names := make([]string, 0, len(sidecars))
-	for n := range sidecars {
-		names = append(names, n)
-	}
-	sort.Strings(names)
-	for _, name := range names {
-		if !allowed[name] {
-			continue
-		}
-		dest := filepath.Join(sidecarDir, name)
-		if _, err := os.Stat(dest); err == nil {
-			bak := dest + ".bak-" + time.Now().Format("20060102-150405")
-			if err := os.Rename(dest, bak); err != nil {
-				return nil, fmt.Errorf("备份旧 %s 失败: %w", name, err)
-			}
-		}
-		if err := copyFile(sidecars[name], dest); err != nil {
-			return nil, fmt.Errorf("写入 %s 失败: %w", name, err)
-		}
-		os.Chmod(dest, 0600)
-		summary.Files = append(summary.Files, name)
+	for _, f := range files {
+		summary.Files = append(summary.Files, filepath.Base(f.dest))
 	}
 	summary.NeedRestart = len(summary.Files) > 0
 	return summary, nil
+}
+
+var restoreRename = os.Rename
+
+type restoreSidecar struct {
+	dest, staged, backup      string
+	existed, saved, installed bool
+}
+
+func stageRestoreSidecars(sidecars map[string]string, dir string) (files []*restoreSidecar, err error) {
+	defer func() {
+		if err != nil {
+			for _, f := range files {
+				os.Remove(f.staged)
+			}
+		}
+	}()
+	names := []string{}
+	for name := range sidecars {
+		if name == "config.json" || name == "ilink_credentials.json" || name == "totp_secret.json" {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		f := &restoreSidecar{dest: filepath.Join(dir, name)}
+		mode := os.FileMode(0600)
+		info, statErr := os.Lstat(f.dest)
+		if statErr == nil {
+			if !info.Mode().IsRegular() {
+				return files, fmt.Errorf("旁路文件目标不是普通文件: %s", name)
+			}
+			f.existed = true
+			mode = info.Mode().Perm()
+		} else if !os.IsNotExist(statErr) {
+			return files, statErr
+		}
+		tmp, createErr := os.CreateTemp(dir, ".restore-*")
+		if createErr != nil {
+			return files, createErr
+		}
+		f.staged = tmp.Name()
+		f.backup = f.dest + ".bak-" + filepath.Base(f.staged)
+		files = append(files, f)
+		if err := tmp.Close(); err != nil {
+			return files, err
+		}
+		if err := copyFile(sidecars[name], f.staged); err != nil {
+			return files, err
+		}
+		if err := os.Chmod(f.staged, mode); err != nil {
+			return files, err
+		}
+	}
+	return files, nil
+}
+
+func rollbackRestoreSidecars(files []*restoreSidecar) error {
+	var result error
+	for i := len(files) - 1; i >= 0; i-- {
+		f := files[i]
+		if f.installed {
+			if err := os.Remove(f.dest); err != nil && !os.IsNotExist(err) {
+				result = errors.Join(result, err)
+				continue
+			}
+		}
+		if f.saved {
+			if err := os.Rename(f.backup, f.dest); err != nil {
+				result = errors.Join(result, fmt.Errorf("回滚旁路文件失败，原文件保留在 %s: %w", f.backup, err))
+			}
+		}
+	}
+	return result
 }
 
 // decryptSidecars 把解压出来的旁路文件统一转成明文视图：

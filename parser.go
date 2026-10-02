@@ -9,10 +9,12 @@ import (
 
 // Message 表示解析出来的一条聊天消息
 type Message struct {
-	Sender     string    // "me" 或 "other"
-	SenderName string    // 发送方昵称
-	Content    string    // 消息正文（多行用 \n 连接）
-	Timestamp  time.Time // 消息时间
+	Sender          string    // "me" 或 "other"
+	SenderName      string    // 发送方昵称
+	Content         string    // 消息正文（多行用 \n 连接）
+	Timestamp       time.Time // 消息时间
+	profileEpoch    uint64
+	profileSnapshot bool
 }
 
 var (
@@ -65,6 +67,10 @@ func classifySender(name, myName string) string {
 func parseTime(s string) time.Time {
 	raw := s
 	s = strings.TrimSpace(s)
+	s = strings.ReplaceAll(s, "-", "/")
+	s = strings.ReplaceAll(s, "上午", "AM")
+	s = strings.ReplaceAll(s, "下午", "PM")
+	s = regexp.MustCompile(`\s*(AM|PM)$`).ReplaceAllString(s, " $1")
 	s = strings.ReplaceAll(s, "年", "/")
 	s = strings.ReplaceAll(s, "月", "/")
 	s = strings.ReplaceAll(s, "日", "")

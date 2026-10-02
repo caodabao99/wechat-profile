@@ -8,6 +8,17 @@ import (
 	"time"
 )
 
+type mergeMessageSnapshot struct {
+	ID                    int64
+	Sender, Content, Hash string
+	Time, Captured        sql.NullString
+}
+
+type mergeProfileSnapshot struct {
+	JSON, Summary, Updated sql.NullString
+	Count                  int
+}
+
 // MergeOptions 合并选项
 type MergeOptions struct {
 	UseSourceNameAsDisplay bool // 显示名改用新昵称（源昵称）
@@ -111,6 +122,37 @@ func MergeContacts(db *sql.DB, sourceID, targetID int64, opts MergeOptions) (Mer
 	movedMsgs, _ := res.RowsAffected()
 	result.MovedMessages = int(movedMsgs)
 
+	var deleted []mergeMessageSnapshot
+	rows, err = tx.Query(`SELECT id, sender, content, msg_hash, msg_time, captured_at FROM messages WHERE contact_id = ?`, sourceID)
+	if err != nil {
+		return result, err
+	}
+	for rows.Next() {
+		var m mergeMessageSnapshot
+		if err := rows.Scan(&m.ID, &m.Sender, &m.Content, &m.Hash, &m.Time, &m.Captured); err != nil {
+			rows.Close()
+			return result, err
+		}
+		deleted = append(deleted, m)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return result, err
+	}
+	rows.Close()
+	deletedJSON, err := json.Marshal(deleted)
+	if err != nil {
+		return result, err
+	}
+	var before mergeProfileSnapshot
+	if err := tx.QueryRow(`SELECT profile_json, profile_summary, last_updated, COALESCE(profile_msg_count,0) FROM contacts WHERE id = ?`, targetID).Scan(&before.JSON, &before.Summary, &before.Updated, &before.Count); err != nil {
+		return result, err
+	}
+	beforeJSON, err := json.Marshal(before)
+	if err != nil {
+		return result, err
+	}
+
 	// 3. 清理源联系人残留的重复消息（撞唯一键没被搬走的）
 	if _, err := tx.Exec(`DELETE FROM messages WHERE contact_id = ?`, sourceID); err != nil {
 		return result, err
@@ -209,10 +251,10 @@ func MergeContacts(db *sql.DB, sourceID, targetID int64, opts MergeOptions) (Mer
 	// 10. 写 merge_log
 	msgIDsJSON, _ := json.Marshal(msgIDs)
 	historyIDsJSON, _ := json.Marshal(historyIDs)
-	res, err = tx.Exec(`INSERT INTO merge_log (source_id, target_id, source_name, target_name, moved_message_ids, moved_history_ids, profile_copied, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+	res, err = tx.Exec(`INSERT INTO merge_log (source_id, target_id, source_name, target_name, moved_message_ids, moved_history_ids, profile_copied, created_at, deleted_messages, target_profile)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		sourceID, targetID, sourceName, targetName, string(msgIDsJSON), string(historyIDsJSON),
-		profileCopied, time.Now().Format(time.RFC3339))
+		profileCopied, time.Now().Format(time.RFC3339), string(deletedJSON), string(beforeJSON))
 	if err != nil {
 		return result, err
 	}
@@ -243,6 +285,7 @@ func MergeContacts(db *sql.DB, sourceID, targetID int64, opts MergeOptions) (Mer
 		return result, err
 	}
 
+	profileEpoch++
 	return result, nil
 }
 
@@ -299,17 +342,27 @@ func UndoMerge(db *sql.DB, mergeLogID int64) error {
 		MovedHistoryIDs string
 		ProfileCopied   int
 		UndoneAt        sql.NullString
+		DeletedMessages string
+		TargetProfile   string
 	}
 	err := db.QueryRow(`SELECT source_id, target_id, source_name, target_name, moved_message_ids, moved_history_ids,
-		COALESCE(profile_copied, 0), undone_at
+		COALESCE(profile_copied, 0), undone_at, COALESCE(deleted_messages,'[]'), COALESCE(target_profile,'')
 		FROM merge_log WHERE id = ?`, mergeLogID).
 		Scan(&log.SourceID, &log.TargetID, &log.SourceName, &log.TargetName,
-			&log.MovedMessageIDs, &log.MovedHistoryIDs, &log.ProfileCopied, &log.UndoneAt)
+			&log.MovedMessageIDs, &log.MovedHistoryIDs, &log.ProfileCopied, &log.UndoneAt, &log.DeletedMessages, &log.TargetProfile)
 	if err != nil {
 		return fmt.Errorf("合并日志不存在: %w", err)
 	}
 	if log.UndoneAt.Valid {
 		return fmt.Errorf("该合并已撤销")
+	}
+
+	var dependent int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM merge_log WHERE id > ? AND undone_at IS NULL AND (source_id IN (?,?) OR target_id IN (?,?))`, mergeLogID, log.SourceID, log.TargetID, log.SourceID, log.TargetID).Scan(&dependent); err != nil {
+		return err
+	}
+	if dependent != 0 {
+		return fmt.Errorf("请先撤销涉及这些联系人的后续合并")
 	}
 
 	var msgIDs, historyIDs []int64
@@ -334,6 +387,16 @@ func UndoMerge(db *sql.DB, mergeLogID int64) error {
 	// 2. 搬回消息
 	for _, msgID := range msgIDs {
 		if _, err := tx.Exec(`UPDATE messages SET contact_id = ? WHERE id = ?`, log.SourceID, msgID); err != nil {
+			return err
+		}
+	}
+
+	var deleted []mergeMessageSnapshot
+	if err := json.Unmarshal([]byte(log.DeletedMessages), &deleted); err != nil {
+		return fmt.Errorf("解析重复消息快照失败: %w", err)
+	}
+	for _, m := range deleted {
+		if _, err := tx.Exec(`INSERT INTO messages (id, contact_id, sender, content, msg_hash, msg_time, captured_at) VALUES (?,?,?,?,?,?,?)`, m.ID, log.SourceID, m.Sender, m.Content, m.Hash, m.Time, m.Captured); err != nil {
 			return err
 		}
 	}
@@ -408,9 +471,17 @@ func UndoMerge(db *sql.DB, mergeLogID int64) error {
 	// 5b. 回滚画像拷贝：合并时若把 source 的画像拷给了 target，撤销后 target 的消息集
 	//     已经变回去了，那份画像（尤其是合并后又基于合并消息集重新生成过的）不再可信，
 	//     必须清空，让它下次重新生成。
-	if log.ProfileCopied != 0 {
-		if _, err := tx.Exec(`UPDATE contacts SET profile_json = '{}', profile_summary = '' WHERE id = ?`,
-			log.TargetID); err != nil {
+	if log.TargetProfile != "" {
+		var before mergeProfileSnapshot
+		if err := json.Unmarshal([]byte(log.TargetProfile), &before); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`UPDATE contacts SET profile_json=?, profile_summary=?, last_updated=?, profile_msg_count=? WHERE id=?`, before.JSON, before.Summary, before.Updated, before.Count, log.TargetID); err != nil {
+			return err
+		}
+	} else {
+		// Legacy logs have no trustworthy pre-merge profile snapshot.
+		if _, err := tx.Exec(`UPDATE contacts SET profile_json='{}', profile_summary='', profile_msg_count=0 WHERE id=?`, log.TargetID); err != nil {
 			return err
 		}
 	}
@@ -446,6 +517,7 @@ func UndoMerge(db *sql.DB, mergeLogID int64) error {
 		return err
 	}
 
+	profileEpoch++
 	return nil
 }
 

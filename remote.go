@@ -207,6 +207,10 @@ func (c *RemoteClient) DeleteContact(id int64) error {
 
 // ---- LLM 操作 ----
 
+func (c *RemoteClient) EditProfile(id int64, profile Profile, base string) error {
+	return c.do("PUT", fmt.Sprintf("/api/contacts/%d/profile", id), map[string]interface{}{"profile": profile, "baseProfileJson": base}, nil)
+}
+
 // SupplementProfile 补充画像
 func (c *RemoteClient) SupplementProfile(id int64, note string) error {
 	return c.do("POST", fmt.Sprintf("/api/contacts/%d/supplement", id),
@@ -228,6 +232,24 @@ func (c *RemoteClient) AnalyzeIntent(id int64, message string) (map[string]inter
 	var out map[string]interface{}
 	err := c.do("POST", fmt.Sprintf("/api/contacts/%d/analyze", id),
 		map[string]string{"message": message}, &out)
+	return out, err
+}
+
+func (c *RemoteClient) RewriteReply(id int64, text, style string) (string, error) {
+	var out struct {
+		Reply string `json:"reply"`
+	}
+	err := c.do("POST", fmt.Sprintf("/api/contacts/%d/rewrite", id), map[string]string{"text": text, "style": style}, &out)
+	return out.Reply, err
+}
+func (c *RemoteClient) ReviewDraft(id int64, text string) (*DraftReview, error) {
+	var out DraftReview
+	err := c.do("POST", fmt.Sprintf("/api/contacts/%d/review-draft", id), map[string]string{"text": text}, &out)
+	return &out, err
+}
+func (c *RemoteClient) ProfileChanges(id int64) (ProfileChanges, error) {
+	var out ProfileChanges
+	err := c.do("GET", fmt.Sprintf("/api/contacts/%d/profile-changes", id), nil, &out)
 	return out, err
 }
 

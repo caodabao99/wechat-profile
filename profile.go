@@ -87,6 +87,7 @@ type Profile struct {
 // 画像是「读旧 JSON → 调 LLM → 写回」的非原子过程，同一联系人并发跑两次时，
 // 后写的一方会用自己那份旧 JSON 覆盖前者的结果，用户手动补充的信息可能凭空消失。
 var ErrProfileBusy = errors.New("该联系人的画像正在生成中，请稍后再试")
+var ErrProfileStale = errors.New("联系人数据已因编辑、合并、撤销或恢复发生变化，请重新加载后再试")
 
 var (
 	// profileGuard 只保护 profileLocks 这张表本身，持锁时间极短，
@@ -208,6 +209,12 @@ func formatMessagesForPromptLimited(messages []Message) string {
 // messages 为本次用于生成画像的聊天记录（通常是本次复制的消息；合并重生成时为该联系人全部消息）。
 // 同一联系人已有画像任务在跑时返回 ErrProfileBusy，调用方应原样反馈给用户。
 func GenerateOrUpdateProfile(ctx context.Context, db *sql.DB, llmClient *LLMClient, contactID int64, contactName string, messages []Message) error {
+	epoch := currentProfileEpoch()
+	for _, m := range messages {
+		if m.profileSnapshot && m.profileEpoch != epoch {
+			return ErrProfileStale
+		}
+	}
 	// 防护：如果联系人已被合并，重定向到目标联系人
 	merged, targetID, err := IsMerged(db, contactID)
 	if err != nil {
@@ -294,7 +301,7 @@ func GenerateOrUpdateProfile(ctx context.Context, db *sql.DB, llmClient *LLMClie
 	// 用模型生成一句话的本次变化说明（失败不影响主流程）
 	changeSummary := summarizeProfileChange(ctx, llmClient, oldJSON, newJSON)
 
-	if err := SaveProfile(db, contactID, newJSON, profile.Summary, changeSummary); err != nil {
+	if err := saveProfileAtEpoch(db, contactID, newJSON, profile.Summary, changeSummary, epoch); err != nil {
 		return fmt.Errorf("保存画像失败: %w", err)
 	}
 	return nil
@@ -327,6 +334,7 @@ func summarizeProfileChange(ctx context.Context, llmClient *LLMClient, oldJSON, 
 // 同一联系人已有画像任务在跑时返回 ErrProfileBusy：手动补充的信息是用户第一手资料，
 // 一旦被并发的自动生成覆盖就再也找不回来，宁可让用户稍后重试。
 func SupplementProfile(ctx context.Context, db *sql.DB, llmClient *LLMClient, contactID int64, contactName string, userNote string) error {
+	epoch := currentProfileEpoch()
 	unlock, ok := tryLockProfile(contactID)
 	if !ok {
 		return ErrProfileBusy
@@ -381,7 +389,7 @@ func SupplementProfile(ctx context.Context, db *sql.DB, llmClient *LLMClient, co
 	// 完整记录用户补充的内容，不做截断（列表显示时再截断）
 	changeSummary := "手动补充: " + strings.TrimSpace(userNote)
 
-	if err := SaveProfile(db, contactID, newJSON, profile.Summary, changeSummary); err != nil {
+	if err := saveProfileAtEpoch(db, contactID, newJSON, profile.Summary, changeSummary, epoch); err != nil {
 		return fmt.Errorf("保存画像失败: %w", err)
 	}
 	return nil
@@ -412,9 +420,10 @@ func AnalyzeIntent(ctx context.Context, db *sql.DB, llmClient *LLMClient, contac
   "intent": "潜在意图，从[邀约/试探/求安慰/敷衍/婉拒/分享/日常寒暄/其他]中选择",
   "emotion": "情绪状态",
   "subtext": "潜台词",
-  "suggested_reply": "建议回复",
+  "suggested_replies": ["建议回复1", "建议回复2", "建议回复3"],
   "confidence": 0.0
 }
+suggested_replies 请给出3条在沟通目的或回应策略上实质不同、自然可直接发送的回复供选择，例如共情回应、追问了解、提出行动建议；根据语境选择合适策略，不要只更换措辞，不要编造事实。
 只输出 JSON，不要其他内容。`,
 		profileSummary, formatMessagesForPromptLimited(messages), strings.TrimSpace(newMessage))
 
@@ -427,7 +436,86 @@ func AnalyzeIntent(ctx context.Context, db *sql.DB, llmClient *LLMClient, contac
 	if err := json.Unmarshal([]byte(ExtractJSON(raw)), &result); err != nil {
 		return nil, fmt.Errorf("解析意图分析结果失败: %w", err)
 	}
+	if result == nil {
+		return nil, fmt.Errorf("意图分析结果为空")
+	}
+	replies := suggestedReplies(result)
+	result["suggested_replies"] = replies
+	result["suggested_reply"] = ""
+	if len(replies) > 0 {
+		result["suggested_reply"] = replies[0]
+	}
 	return result, nil
+}
+
+func suggestedReplies(result map[string]interface{}) []string {
+	out := []string{}
+	seen := map[string]bool{}
+	add := func(s string) {
+		s = strings.TrimSpace(s)
+		if s != "" && !seen[s] && len(out) < 3 {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	switch values := result["suggested_replies"].(type) {
+	case []string:
+		for _, s := range values {
+			add(s)
+		}
+	case []interface{}:
+		for _, v := range values {
+			if s, ok := v.(string); ok {
+				add(s)
+			}
+		}
+	}
+	if len(out) == 0 {
+		if s, ok := result["suggested_reply"].(string); ok {
+			add(s)
+		}
+	}
+	return out
+}
+
+var ErrProfileConflict = errors.New("画像已发生变化，请重新打开编辑并核对后保存")
+
+// EditProfile 原样保存用户编辑；保留消息分析进度，并使编辑前启动的生成任务失效。
+func EditProfile(db *sql.DB, contactID int64, profile Profile, baseProfileJSON string) error {
+	data, err := json.MarshalIndent(profile, "", "  ")
+	if err != nil {
+		return err
+	}
+	dbMu.Lock()
+	defer dbMu.Unlock()
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var current string
+	var merged sql.NullInt64
+	if err = tx.QueryRow(`SELECT COALESCE(profile_json,''), merged_into FROM contacts WHERE id = ?`, contactID).Scan(&current, &merged); err != nil {
+		return err
+	}
+	if merged.Valid {
+		return ErrProfileStale
+	}
+	if current != baseProfileJSON {
+		return ErrProfileConflict
+	}
+	now := time.Now().Format(time.RFC3339)
+	if _, err = tx.Exec(`UPDATE contacts SET profile_json = ?, profile_summary = ?, last_updated = ? WHERE id = ?`, string(data), profile.Summary, now, contactID); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(`INSERT INTO profile_history (contact_id, profile_json, change_summary, created_at) VALUES (?, ?, ?, ?)`, contactID, string(data), "手动编辑画像", now); err != nil {
+		return err
+	}
+	if err = tx.Commit(); err != nil {
+		return err
+	}
+	profileEpoch++
+	return nil
 }
 
 // orUnknown 空值显示为"暂无"

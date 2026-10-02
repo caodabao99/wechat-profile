@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/atotto/clipboard"
@@ -232,6 +233,13 @@ func doUndoMerge(logID int64) error {
 	return UndoMerge(db, logID)
 }
 
+func doEditProfile(contactID int64, profile Profile, base string) error {
+	if isRemoteMode {
+		return remoteClient.EditProfile(contactID, profile, base)
+	}
+	return EditProfile(db, contactID, profile, base)
+}
+
 // doSupplement 补充画像（自动适配本地/远程）
 func doSupplement(contactID int64, note string) error {
 	if isRemoteMode {
@@ -275,6 +283,29 @@ func doDeleteContact(contactID int64) error {
 		return remoteClient.DeleteContact(contactID)
 	}
 	return DeleteContactByID(db, contactID)
+}
+
+func doRewriteReply(id int64, text, style string) (string, error) {
+	if isRemoteMode {
+		return remoteClient.RewriteReply(id, text, style)
+	}
+	ctx, cancel := taskContext()
+	defer cancel()
+	return RewriteReply(ctx, db, llmClient, id, text, style)
+}
+func doReviewDraft(id int64, text string) (*DraftReview, error) {
+	if isRemoteMode {
+		return remoteClient.ReviewDraft(id, text)
+	}
+	ctx, cancel := taskContext()
+	defer cancel()
+	return ReviewDraft(ctx, db, llmClient, id, text)
+}
+func fetchProfileChanges(id int64) (ProfileChanges, error) {
+	if isRemoteMode {
+		return remoteClient.ProfileChanges(id)
+	}
+	return GetProfileChanges(db, id)
 }
 
 // doAnalyzeIntent 意图分析（自动适配本地/远程）
@@ -450,7 +481,6 @@ func doGetMergeCandidates(excludeID int64) ([]Contact, error) {
 func ShowResultWindowRemote(result *IngestResult) {
 	var dlg *walk.Dialog
 	var summaryLabel *walk.Label
-	var suggestionTE *walk.TextEdit
 	var confidencePB *walk.ProgressBar
 	var confidenceLabel *walk.Label
 
@@ -501,13 +531,19 @@ func ShowResultWindowRemote(result *IngestResult) {
 			{"潜在意图", "intent"},
 			{"情绪状态", "emotion"},
 			{"潜台词", "subtext"},
-			{"建议回复", "suggested_reply"},
+		}
+		for i, reply := range suggestedReplies(result.Intent) {
+			key := fmt.Sprintf("suggested_reply_%d", i)
+			result.Intent[key] = reply
+			cardKeys = append(cardKeys, struct{ title, key string }{fmt.Sprintf("建议回复 %d", i+1), key})
 		}
 
 		for _, c := range cardKeys {
+			var suggestionTE *walk.TextEdit
 			content := fieldString(result.Intent, c.key)
-			if c.key == "suggested_reply" {
-				children = append(children,
+			if strings.HasPrefix(c.key, "suggested_reply_") {
+				controls := rewriteControls(result.ContactID, &suggestionTE)
+				children = append(children, controls,
 					dl.GroupBox{
 						Title:  c.title,
 						Layout: dl.VBox{MarginsZero: true, Spacing: 4},
@@ -597,8 +633,9 @@ func ShowResultWindowRemote(result *IngestResult) {
 		AssignTo: &dlg,
 		Title:    "意图分析结果",
 		MinSize:  dl.Size{Width: 520, Height: 480},
+		Size:     dl.Size{Width: 560, Height: 650},
 		Layout:   dl.VBox{Spacing: 8},
-		Children: children,
+		Children: []dl.Widget{dl.ScrollView{Layout: dl.VBox{Spacing: 8}, Children: children}},
 	}).Create(mainWindow); err != nil {
 		showError("创建结果窗口失败: " + err.Error())
 		return

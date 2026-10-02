@@ -1,12 +1,152 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
+	"reflect"
+	"sort"
 	"strings"
 
 	"github.com/lxn/walk"
 	dl "github.com/lxn/walk/declarative"
 )
+
+func showEditProfileDialog(id int64, onDone func()) {
+	contact, err := fetchContactByID(id)
+	if err != nil {
+		showError(err.Error())
+		return
+	}
+	var profile Profile
+	if strings.TrimSpace(contact.ProfileJSON) != "" {
+		if err := json.Unmarshal([]byte(contact.ProfileJSON), &profile); err != nil {
+			showError("画像无法解析: " + err.Error())
+			return
+		}
+	}
+	labels := map[string]string{"occupation": "职业", "location": "城市/地区", "important_dates": "重要日子", "personality": "性格特征", "reply_length": "回复长短", "tone": "语气", "frequent_phrases": "常用表达", "emoji_usage": "表情习惯", "initiative": "主动程度", "interests": "兴趣爱好", "stressors": "压力源/雷点", "comfort_topics": "安慰话题", "when_upset": "不高兴时的表现", "closeness": "亲密程度", "recent_events": "近期共同事件", "interaction_pattern": "互动模式", "intent_patterns": "意图模式", "important_facts": "重要事实", "summary": "核心摘要"}
+	var dlg *walk.Dialog
+	var saveBtn, cancelBtn *walk.PushButton
+	var saving bool
+	var fields []dl.Widget
+	var collect []func() error
+	var addFields func(reflect.Value)
+	addFields = func(value reflect.Value) {
+		for i := 0; i < value.NumField(); i++ {
+			v := value.Field(i)
+			if v.Kind() == reflect.Struct {
+				addFields(v)
+				continue
+			}
+			label := labels[value.Type().Field(i).Tag.Get("json")]
+			text := ""
+			switch v.Kind() {
+			case reflect.String:
+				text = v.String()
+			case reflect.Slice:
+				items := []string{}
+				for j := 0; j < v.Len(); j++ {
+					items = append(items, v.Index(j).String())
+				}
+				text = strings.Join(items, "\r\n")
+				label += "（每行一项）"
+			case reflect.Map:
+				keys := v.MapKeys()
+				sort.Slice(keys, func(i, j int) bool { return keys[i].String() < keys[j].String() })
+				items := []string{}
+				for _, k := range keys {
+					items = append(items, k.String()+"："+v.MapIndex(k).String())
+				}
+				text = strings.Join(items, "\r\n")
+				label += "（每行 名称：描述；清空删除）"
+			}
+			var editor *walk.TextEdit
+			fields = append(fields, dl.Label{Text: label}, dl.TextEdit{AssignTo: &editor, Text: text, VScroll: true, MinSize: dl.Size{Width: 460, Height: 55}})
+			collect = append(collect, func() error {
+				s := strings.TrimSpace(editor.Text())
+				switch v.Kind() {
+				case reflect.String:
+					v.SetString(s)
+				case reflect.Slice:
+					items := reflect.MakeSlice(v.Type(), 0, 0)
+					for _, line := range strings.Split(s, "\n") {
+						if line = strings.TrimSpace(line); line != "" {
+							items = reflect.Append(items, reflect.ValueOf(line))
+						}
+					}
+					v.Set(items)
+				case reflect.Map:
+					items := reflect.MakeMap(v.Type())
+					for _, line := range strings.Split(s, "\n") {
+						line = strings.TrimSpace(line)
+						if line == "" {
+							continue
+						}
+						pos := strings.IndexAny(line, ":：")
+						if pos < 0 {
+							return fmt.Errorf("意图模式请按 名称：描述 填写")
+						}
+						key := strings.TrimSpace(line[:pos])
+						rest := strings.TrimLeft(line[pos:], ":：")
+						if key == "" || items.MapIndex(reflect.ValueOf(key)).IsValid() {
+							return fmt.Errorf("意图名称不能为空或重复")
+						}
+						items.SetMapIndex(reflect.ValueOf(key), reflect.ValueOf(strings.TrimSpace(rest)))
+					}
+					v.Set(items)
+				}
+				return nil
+			})
+		}
+	}
+	addFields(reflect.ValueOf(&profile).Elem())
+	if err := (dl.Dialog{AssignTo: &dlg, Title: "编辑当前画像", Size: dl.Size{Width: 560, Height: 650}, Layout: dl.VBox{}, Children: []dl.Widget{
+		dl.Label{Text: "清空字段可删除信息；再次 AI 生成可能重新提取。"},
+		dl.ScrollView{Layout: dl.VBox{}, Children: fields},
+		dl.Composite{Layout: dl.HBox{}, Children: []dl.Widget{
+			dl.PushButton{AssignTo: &saveBtn, Text: "保存", OnClicked: func() {
+				for _, get := range collect {
+					if err := get(); err != nil {
+						showError(err.Error())
+						return
+					}
+				}
+				saving = true
+				saveBtn.SetEnabled(false)
+				cancelBtn.SetEnabled(false)
+				go func(p Profile) {
+					err := doEditProfile(id, p, contact.ProfileJSON)
+					mainWindow.Synchronize(func() {
+						if dlg.IsDisposed() {
+							return
+						}
+						saving = false
+						saveBtn.SetEnabled(true)
+						cancelBtn.SetEnabled(true)
+						if err != nil {
+							showError(err.Error())
+							return
+						}
+						dlg.Accept()
+						if onDone != nil {
+							onDone()
+						}
+					})
+				}(profile)
+			}},
+			dl.PushButton{AssignTo: &cancelBtn, Text: "取消", OnClicked: func() { dlg.Cancel() }},
+		}},
+	}}).Create(mainWindow); err != nil {
+		showError(err.Error())
+		return
+	}
+	dlg.Closing().Attach(func(canceled *bool, reason walk.CloseReason) {
+		if saving {
+			*canceled = true
+		}
+	})
+	dlg.Run()
+}
 
 // showSupplementDialog 弹出手动补充画像信息的对话框
 func showSupplementDialog(contact Contact, onDone func()) {
