@@ -77,8 +77,9 @@ func makeDialogResizable(dlg *walk.Dialog) {
 // createFitDialog 创建「可滚动内容 + 固定底部按钮行」的弹窗骨架。
 // ScrollView 关闭横向滚动（HorizontalFixed）：内容永远按可用宽度换行，
 // 不会再冒出横向滚动条；宽度超出屏幕的极端情况下才可能裁切。
-// 配合 CompactHeight 的 TextEdit，内容会按文字行数撑高。
-// 返回 dlg 与 sv，调用方接着调 armAutoFitScroll，最后 dlg.Run()。
+// 内部控件一律固定 MinSize 高度 + VScroll：高度只由 MinSize 决定，
+// 文字永远不会拦腰截断，放不下的内容出内部滚动条兜底。
+// 返回 dlg 与 sv，调用方接着调 makeDialogResizable，最后 dlg.Run()。
 func createFitDialog(title string, width96, height96 int, body, bottomBar []dl.Widget) (*walk.Dialog, *walk.ScrollView) {
 	var dlg *walk.Dialog
 	var sv *walk.ScrollView
@@ -99,8 +100,9 @@ func createFitDialog(title string, width96, height96 int, body, bottomBar []dl.W
 	if err := (dl.Dialog{
 		AssignTo: &dlg,
 		Title:    title,
-		// 高度下限给小一点：开屏实际高度由 armAutoFitScroll 按内容测量后决定
-		MinSize:  dl.Size{Width: width96, Height: 240},
+		// walk 的 Dialog.Show 按 max(布局最小尺寸, MinSize) 开窗，而 ScrollView
+		// 不向父布局汇报内容高度，所以开屏尺寸就是这里的 MinSize/Size
+		MinSize:  dl.Size{Width: width96, Height: height96},
 		Size:     dl.Size{Width: width96, Height: height96},
 		Layout:   dl.VBox{Spacing: 8},
 		Children: children,
@@ -108,51 +110,21 @@ func createFitDialog(title string, width96, height96 int, body, bottomBar []dl.W
 		showError("创建窗口失败: " + err.Error())
 		return nil, nil
 	}
+	clampDialogOpenSize(dlg)
 	return dlg, sv
 }
 
-// armAutoFitScroll 让弹窗在 Run/Show 开屏时自动开到「刚好完整显示内容」的高度：
-//  1. 先借 walk 在 WM_ENTERSIZEMOVE 期间的同步布局通道强制布局一遍
-//     （此刻窗口还没显示，用户看不到过程），拿到 CompactHeight 控件按文字
-//     换行后的真实位置；
-//  2. 据内容总高设置窗口最小高度——Dialog.Show 会把窗口开到这个高度，
-//     屏幕放不下时钳制到工作区高度（内部滚动保留）；
-//  3. 首次 SizeChanged 时重新居中，并解除最小高度锁定，之后用户可自由拖小。
+// clampDialogOpenSize 把弹窗的开屏尺寸钳制到屏幕工作区内，并在开屏后放开
+// 最小尺寸限制。窗口位置不做任何调整：walk 默认以 owner（悬浮窗）为中心
+// 定位并钳到屏幕内，弹窗自然靠屏幕右侧显示，与画像窗等其他弹窗一致。
 //
-// 没有这个机制时，ScrollView 不向父布局汇报内容高度，Dialog.Show 会把窗口
-// 缩到 MinSize，底部按钮和单选框被挤出可视区，用户每次都得手动拖长窗口。
-func armAutoFitScroll(dlg *walk.Dialog, sv *walk.ScrollView, width96, floorH96 int) {
-	if dlg == nil || sv == nil {
+// 为什么需要它：开屏尺寸来自 declarative 的 MinSize（820 这类固定值），
+// 在 1366×768 的笔记本或高 DPI 缩放屏幕上会超出工作区，底部按钮会被
+// 任务栏挡住点不到；而 MinSize 不放开的话，用户又无法把窗口往小拖。
+func clampDialogOpenSize(dlg *walk.Dialog) {
+	if dlg == nil {
 		return
 	}
-	hwnd := dlg.Handle()
-	style := win.GetWindowLong(hwnd, win.GWL_STYLE)
-	win.SetWindowLong(hwnd, win.GWL_STYLE, style|win.WS_THICKFRAME|win.WS_MAXIMIZEBOX)
-	win.SetWindowPos(hwnd, 0, 0, 0, 0, 0,
-		win.SWP_NOMOVE|win.SWP_NOSIZE|win.SWP_NOZORDER|win.SWP_NOACTIVATE|win.SWP_FRAMECHANGED)
-
-	// walk 在收到 WM_ENTERSIZEMOVE 后会把布局结果改为同步等待，
-	// 这样下面的 SetBoundsPixels 返回时内部布局已经算完，可以直接读坐标。
-	// 尺寸必须真的变化才会触发 WM_WINDOWPOSCHANGED 里的布局，所以先撑 2px 再还原。
-	win.SendMessage(hwnd, win.WM_ENTERSIZEMOVE, 0, 0)
-	b0 := dlg.BoundsPixels()
-	dlg.SetBoundsPixels(walk.Rectangle{X: b0.X, Y: b0.Y, Width: b0.Width, Height: b0.Height + 2})
-	dlg.SetBoundsPixels(b0)
-	win.SendMessage(hwnd, win.WM_EXITSIZEMOVE, 0, 0)
-
-	svClient := sv.ClientBoundsPixels()
-
-	// 内容总高：滚动区里最后一个控件的底边 + VBox 下侧留白（默认 9 设计像素）
-	contentBottom := svClient.Y
-	kids := sv.Children()
-	for i := 0; i < kids.Len(); i++ {
-		b := kids.At(i).BoundsPixels()
-		if b.Y+b.Height > contentBottom {
-			contentBottom = b.Y + b.Height
-		}
-	}
-	contentH := contentBottom - svClient.Y + sv.IntFrom96DPI(9)
-
 	// 工作区（排除任务栏），PerMonitorV2 进程拿到的是物理像素
 	var rc win.RECT
 	win.SystemParametersInfo(spiGetWorkArea, 0, unsafe.Pointer(&rc), 0)
@@ -160,48 +132,28 @@ func armAutoFitScroll(dlg *walk.Dialog, sv *walk.ScrollView, width96, floorH96 i
 	edge := dlg.IntFrom96DPI(edge96)
 	maxW := int(rc.Right-rc.Left) - edge
 	maxH := int(rc.Bottom-rc.Top) - edge
-
-	cur := dlg.BoundsPixels()
-	wantH := cur.Height + (contentH - svClient.Height)
-	if floor := dlg.IntFrom96DPI(floorH96); wantH < floor {
-		wantH = floor
+	// 未显示时 BoundsPixels 即 declarative Size 换算出的物理像素
+	b := dlg.BoundsPixels()
+	w, h := b.Width, b.Height
+	if w > maxW {
+		w = maxW
 	}
-	if wantH > maxH {
-		wantH = maxH
+	if h > maxH {
+		h = maxH
 	}
-	wantW := cur.Width
-	if wantW > maxW {
-		wantW = maxW
-	}
-
-	// Dialog.Show 取 max(布局最小尺寸, MinSizePixels)；ScrollView 不汇报高度，
-	// 所以把开屏高度作为最小高度喂给它，宽度同样以设计宽度为下限
-	dlg.SetMinMaxSizePixels(walk.Size{Width: dlg.IntFrom96DPI(width96), Height: wantH}, walk.Size{})
-
-	armed := true
-	dlg.SizeChanged().Attach(func() {
-		if !armed {
+	// SetMinMaxSizePixels 收物理像素；Show() 开窗取 max(布局最小值, MinSizePixels)，
+	// 钳制后的开屏尺寸从这里生效
+	_ = dlg.SetMinMaxSizePixels(walk.Size{Width: w, Height: h}, walk.Size{})
+	// Show 之后再放开最小尺寸：允许用户把窗口往小拖，内容由 ScrollView 兜底滚动。
+	// Synchronize 只是入队，会在 Run 的消息循环里、Show 之后才执行。
+	dlg.Synchronize(func() {
+		if dlg.IsDisposed() {
 			return
 		}
-		armed = false
-		b := dlg.BoundsPixels()
-		w, h := b.Width, b.Height
-		if w > maxW {
-			w = maxW
-		}
-		if h > maxH {
-			h = maxH
-		}
-		x := int(rc.Left) + (int(rc.Right-rc.Left)-w)/2
-		y := int(rc.Top) + (int(rc.Bottom-rc.Top)-h)/2
-		// 开屏高度锁定解除：允许用户之后把窗口拖小，内容由 ScrollView 兜底
-		dlg.SetMinMaxSizePixels(walk.Size{
+		_ = dlg.SetMinMaxSizePixels(walk.Size{
 			Width:  dlg.IntFrom96DPI(480),
-			Height: dlg.IntFrom96DPI(floorH96),
+			Height: dlg.IntFrom96DPI(360),
 		}, walk.Size{})
-		if w != b.Width || h != b.Height || x != b.X || y != b.Y {
-			_ = dlg.SetBoundsPixels(walk.Rectangle{X: x, Y: y, Width: w, Height: h})
-		}
 	})
 }
 
@@ -239,13 +191,14 @@ func presentResultDialog(contactID int64, body []dl.Widget, confidenceVal int) {
 		},
 	}
 
-	var sv *walk.ScrollView
-	dlg, sv = createFitDialog("意图分析结果", 680, 820, body, bottomBar)
+	dlg, _ = createFitDialog("意图分析结果", 680, 820, body, bottomBar)
 	if dlg == nil {
 		return
 	}
 	setTopMost(dlg.Handle())
-	armAutoFitScroll(dlg, sv, 680, 360)
+	// 可拖拽缩放/最大化；开屏尺寸钳制已在 createFitDialog 里做，
+	// 位置不干预（walk 默认以悬浮窗为中心定位，靠右显示）
+	makeDialogResizable(dlg)
 
 	if confidencePB != nil && confidenceVal > 0 {
 		confidencePB.SetValue(confidenceVal)
@@ -608,8 +561,9 @@ func confidenceText(v int) string {
 }
 
 // ShowResultWindow 弹出意图分析结果窗口（卡片式布局）。
-// 卡片 TextEdit 全部 CompactHeight：按文字行数自己撑高，窗口再由
-// presentResultDialog 按内容总高开到刚好显示全，不再需要手动拖长。
+// 卡片 TextEdit 全部固定高度 + VScroll：文字不会被拦腰截断，放不下出滚动条；
+// 开屏 680×820（超出工作区时由 clampDialogOpenSize 钳制），位置随 walk
+// 默认以悬浮窗为中心、靠屏幕右侧显示。
 func ShowResultWindow(contactID int64, contactName string, newCount int, viaAlias bool, result map[string]interface{}, analysisErr error) {
 	// -1 表示这次没有置信度可显示（分析失败或模型没给）
 	confidenceVal := -1
@@ -632,9 +586,10 @@ func ShowResultWindow(contactID int64, contactName string, newCount int, viaAlia
 				Layout: dl.VBox{MarginsZero: true},
 				Children: []dl.Widget{
 					dl.TextEdit{
-						ReadOnly:      true,
-						CompactHeight: true,
-						Text:          analysisErr.Error(),
+						ReadOnly: true,
+						VScroll:  true,
+						Text:     analysisErr.Error(),
+						MinSize:  dl.Size{Height: 100},
 					},
 				},
 			},
@@ -673,10 +628,11 @@ func ShowResultWindow(contactID int64, contactName string, newCount int, viaAlia
 							Layout: dl.HBox{MarginsZero: true, Spacing: 4},
 							Children: []dl.Widget{
 								dl.TextEdit{
-									AssignTo:      &suggestionTE,
-									ReadOnly:      true,
-									CompactHeight: true,
-									Text:          content,
+									AssignTo: &suggestionTE,
+									ReadOnly: true,
+									VScroll:  true,
+									Text:     content,
+									MinSize:  dl.Size{Height: 56},
 								},
 								dl.PushButton{
 									Text:    "复制",
@@ -699,9 +655,10 @@ func ShowResultWindow(contactID int64, contactName string, newCount int, viaAlia
 					Layout: dl.VBox{MarginsZero: true},
 					Children: []dl.Widget{
 						dl.TextEdit{
-							ReadOnly:      true,
-							CompactHeight: true,
-							Text:          content,
+							ReadOnly: true,
+							VScroll:  true,
+							Text:     content,
+							MinSize:  dl.Size{Height: 72},
 						},
 					},
 				},

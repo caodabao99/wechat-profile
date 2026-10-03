@@ -25,9 +25,9 @@
 
 ### 方式一：直接下载（推荐）
 
-去 [Releases](https://github.com/caodabao99/wechat-profile/releases) 页面下载最新版 `wechat-profile-v2.3.2.zip`，解压到任意目录。
+去 [Releases](https://github.com/caodabao99/wechat-profile/releases) 页面下载最新版 `wechat-profile-v2.3.3.zip`，解压到任意目录。
 
-> 同一个 Release 页面还附带服务端包 `wechat-profile-bot-v2.3.2.zip` 和 Docker 镜像 `wechat-profile-bot-docker-v2.3.2.tar.gz`（用「远程模式」时才需要），服务端的 Linux/Windows/Docker 部署说明见 [wechat-profile-bot](https://github.com/caodabao99/wechat-profile-bot)。
+> 同一个 Release 页面还附带服务端包 `wechat-profile-bot-v2.3.3.zip` 和 Docker 镜像 `wechat-profile-bot-docker-v2.3.3.tar.gz`（用「远程模式」时才需要），服务端的 Linux/Windows/Docker 部署说明见 [wechat-profile-bot](https://github.com/caodabao99/wechat-profile-bot)。
 
 ### 方式二：自行编译
 
@@ -216,6 +216,15 @@ Linux/macOS 下交叉编译可直接执行 `./build.sh`，产物输出到 `dist/
 4. 微信版本更新若导致复制格式变化，解析器内置降级逻辑（整段文本按对方消息处理），但消息时间与发言人识别可能失效，需按新版格式调整 `parser.go` 中的正则。
 
 ## 更新日志
+
+### v2.3.3（2026-10-03）
+
+显示修复专项，升级只需替换 exe。
+
+- **意图分析结果窗 / 编辑画像窗显示异常修复**：撤掉 v2.3.2 的「隐藏窗口预先测内容高度再开窗」机制——实测它算出的控件高度与真实 DPI / 宽度不一致，导致文字被拦腰截断、窗口大小不对。回归固定高度卡片 + 内部滚动：卡片高度只由固定值决定，任何内容都不会再被裁切，放不下出滚动条
+- **弹窗位置统一靠右**：意图分析结果窗不再强制屏幕居中，与画像窗等其他弹窗一样以悬浮窗为锚点、靠屏幕右侧显示
+- **开窗尺寸自动钳制**：开窗尺寸超出屏幕工作区时自动收进（小屏笔记本底部按钮不再被任务栏挡住），开屏后仍可自由拖拽缩放、最大化
+- 远程模式的意图分析结果窗与本地模式同步修复
 
 ### v2.3.2（2026-10-03）
 

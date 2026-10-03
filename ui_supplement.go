@@ -49,10 +49,8 @@ func showEditProfileDialog(id int64, onDone func()) {
 		var te *walk.TextEdit
 		widgets = append(widgets, dl.TextEdit{
 			AssignTo: &te, Text: val, VScroll: true, Font: fontBody,
-			// CompactHeight：高度按文字行数自适应，长概要不再被固定高度裁切；
-			// height 仅作为空字段时的最小高度兜底
-			CompactHeight: true,
-			MinSize:       dl.Size{Height: height},
+			// 固定高度 + 内部滚动：高度只由 MinSize 决定，文字不会被拦腰截断
+			MinSize: dl.Size{Height: height},
 		})
 		collectors = append(collectors, func() error {
 			*target = strings.TrimSpace(te.Text())
@@ -73,8 +71,7 @@ func showEditProfileDialog(id int64, onDone func()) {
 		var te *walk.TextEdit
 		widgets = append(widgets, dl.TextEdit{
 			AssignTo: &te, Text: strings.Join(vals, "\r\n"), VScroll: true, Font: fontBody,
-			CompactHeight: true,
-			MinSize:       dl.Size{Height: height},
+			MinSize: dl.Size{Height: height},
 		})
 		collectors = append(collectors, func() error {
 			items := []string{}
@@ -139,8 +136,7 @@ func showEditProfileDialog(id int64, onDone func()) {
 	var intentTE *walk.TextEdit
 	widgets = append(widgets, dl.TextEdit{
 		AssignTo: &intentTE, Text: strings.Join(intentLines, "\r\n"), VScroll: true, Font: fontBody,
-		CompactHeight: true,
-		MinSize:       dl.Size{Height: 90},
+		MinSize: dl.Size{Height: 90},
 	})
 	collectors = append(collectors, func() error {
 		items := map[string]string{}
@@ -171,7 +167,9 @@ func showEditProfileDialog(id int64, onDone func()) {
 	listField("", "每行一项", profile.ImportantFacts, func(x []string) { profile.ImportantFacts = x }, 70)
 
 	if err := (dl.Dialog{AssignTo: &dlg, Title: "编辑当前画像",
-		MinSize: dl.Size{Width: 480, Height: 360}, Size: dl.Size{Width: 720, Height: 820},
+		// walk 的 Dialog.Show 按 max(布局最小尺寸, MinSize) 开窗，开屏即 720×820，
+		// 超出工作区时由 clampDialogOpenSize 钳制，放不下的内容由 ScrollView 滚动
+		MinSize: dl.Size{Width: 720, Height: 820}, Size: dl.Size{Width: 720, Height: 820},
 		Layout: dl.VBox{Spacing: 6}, Children: []dl.Widget{
 			dl.Label{Text: "分节与画像页一致；清空字段或列表项即可删除，再次 AI 生成可能重新提取。", Font: fontHint},
 			// 关掉横向滚动：字段宽度全部自适应窗口，不再撑出横向滚动条
@@ -214,8 +212,10 @@ func showEditProfileDialog(id int64, onDone func()) {
 		return
 	}
 	setTopMost(dlg.Handle())
-	// 开屏自动开到能完整显示 9 节内容的高度（屏幕放不下时钳制，内部滚动兜底）
-	armAutoFitScroll(dlg, sv, 720, 360)
+	// 可拖拽缩放/最大化 + 开屏尺寸钳制到工作区；位置不干预
+	// （walk 默认以悬浮窗为中心定位，与画像窗等其他弹窗一致靠右显示）
+	makeDialogResizable(dlg)
+	clampDialogOpenSize(dlg)
 	dlg.Closing().Attach(func(canceled *bool, reason walk.CloseReason) {
 		if saving {
 			*canceled = true
