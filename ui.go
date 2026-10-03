@@ -74,6 +74,185 @@ func makeDialogResizable(dlg *walk.Dialog) {
 	}
 }
 
+// createFitDialog 创建「可滚动内容 + 固定底部按钮行」的弹窗骨架。
+// ScrollView 关闭横向滚动（HorizontalFixed）：内容永远按可用宽度换行，
+// 不会再冒出横向滚动条；宽度超出屏幕的极端情况下才可能裁切。
+// 配合 CompactHeight 的 TextEdit，内容会按文字行数撑高。
+// 返回 dlg 与 sv，调用方接着调 armAutoFitScroll，最后 dlg.Run()。
+func createFitDialog(title string, width96, height96 int, body, bottomBar []dl.Widget) (*walk.Dialog, *walk.ScrollView) {
+	var dlg *walk.Dialog
+	var sv *walk.ScrollView
+	children := []dl.Widget{
+		dl.ScrollView{
+			AssignTo:        &sv,
+			HorizontalFixed: true,
+			Layout:          dl.VBox{Spacing: 8},
+			Children:        body,
+		},
+	}
+	if len(bottomBar) > 0 {
+		children = append(children, dl.Composite{
+			Layout:   dl.HBox{MarginsZero: true, Spacing: 8},
+			Children: bottomBar,
+		})
+	}
+	if err := (dl.Dialog{
+		AssignTo: &dlg,
+		Title:    title,
+		// 高度下限给小一点：开屏实际高度由 armAutoFitScroll 按内容测量后决定
+		MinSize:  dl.Size{Width: width96, Height: 240},
+		Size:     dl.Size{Width: width96, Height: height96},
+		Layout:   dl.VBox{Spacing: 8},
+		Children: children,
+	}).Create(mainWindow); err != nil {
+		showError("创建窗口失败: " + err.Error())
+		return nil, nil
+	}
+	return dlg, sv
+}
+
+// armAutoFitScroll 让弹窗在 Run/Show 开屏时自动开到「刚好完整显示内容」的高度：
+//  1. 先借 walk 在 WM_ENTERSIZEMOVE 期间的同步布局通道强制布局一遍
+//     （此刻窗口还没显示，用户看不到过程），拿到 CompactHeight 控件按文字
+//     换行后的真实位置；
+//  2. 据内容总高设置窗口最小高度——Dialog.Show 会把窗口开到这个高度，
+//     屏幕放不下时钳制到工作区高度（内部滚动保留）；
+//  3. 首次 SizeChanged 时重新居中，并解除最小高度锁定，之后用户可自由拖小。
+//
+// 没有这个机制时，ScrollView 不向父布局汇报内容高度，Dialog.Show 会把窗口
+// 缩到 MinSize，底部按钮和单选框被挤出可视区，用户每次都得手动拖长窗口。
+func armAutoFitScroll(dlg *walk.Dialog, sv *walk.ScrollView, width96, floorH96 int) {
+	if dlg == nil || sv == nil {
+		return
+	}
+	hwnd := dlg.Handle()
+	style := win.GetWindowLong(hwnd, win.GWL_STYLE)
+	win.SetWindowLong(hwnd, win.GWL_STYLE, style|win.WS_THICKFRAME|win.WS_MAXIMIZEBOX)
+	win.SetWindowPos(hwnd, 0, 0, 0, 0, 0,
+		win.SWP_NOMOVE|win.SWP_NOSIZE|win.SWP_NOZORDER|win.SWP_NOACTIVATE|win.SWP_FRAMECHANGED)
+
+	// walk 在收到 WM_ENTERSIZEMOVE 后会把布局结果改为同步等待，
+	// 这样下面的 SetBoundsPixels 返回时内部布局已经算完，可以直接读坐标。
+	// 尺寸必须真的变化才会触发 WM_WINDOWPOSCHANGED 里的布局，所以先撑 2px 再还原。
+	win.SendMessage(hwnd, win.WM_ENTERSIZEMOVE, 0, 0)
+	b0 := dlg.BoundsPixels()
+	dlg.SetBoundsPixels(walk.Rectangle{X: b0.X, Y: b0.Y, Width: b0.Width, Height: b0.Height + 2})
+	dlg.SetBoundsPixels(b0)
+	win.SendMessage(hwnd, win.WM_EXITSIZEMOVE, 0, 0)
+
+	svClient := sv.ClientBoundsPixels()
+
+	// 内容总高：滚动区里最后一个控件的底边 + VBox 下侧留白（默认 9 设计像素）
+	contentBottom := svClient.Y
+	kids := sv.Children()
+	for i := 0; i < kids.Len(); i++ {
+		b := kids.At(i).BoundsPixels()
+		if b.Y+b.Height > contentBottom {
+			contentBottom = b.Y + b.Height
+		}
+	}
+	contentH := contentBottom - svClient.Y + sv.IntFrom96DPI(9)
+
+	// 工作区（排除任务栏），PerMonitorV2 进程拿到的是物理像素
+	var rc win.RECT
+	win.SystemParametersInfo(spiGetWorkArea, 0, unsafe.Pointer(&rc), 0)
+	const edge96 = 24
+	edge := dlg.IntFrom96DPI(edge96)
+	maxW := int(rc.Right-rc.Left) - edge
+	maxH := int(rc.Bottom-rc.Top) - edge
+
+	cur := dlg.BoundsPixels()
+	wantH := cur.Height + (contentH - svClient.Height)
+	if floor := dlg.IntFrom96DPI(floorH96); wantH < floor {
+		wantH = floor
+	}
+	if wantH > maxH {
+		wantH = maxH
+	}
+	wantW := cur.Width
+	if wantW > maxW {
+		wantW = maxW
+	}
+
+	// Dialog.Show 取 max(布局最小尺寸, MinSizePixels)；ScrollView 不汇报高度，
+	// 所以把开屏高度作为最小高度喂给它，宽度同样以设计宽度为下限
+	dlg.SetMinMaxSizePixels(walk.Size{Width: dlg.IntFrom96DPI(width96), Height: wantH}, walk.Size{})
+
+	armed := true
+	dlg.SizeChanged().Attach(func() {
+		if !armed {
+			return
+		}
+		armed = false
+		b := dlg.BoundsPixels()
+		w, h := b.Width, b.Height
+		if w > maxW {
+			w = maxW
+		}
+		if h > maxH {
+			h = maxH
+		}
+		x := int(rc.Left) + (int(rc.Right-rc.Left)-w)/2
+		y := int(rc.Top) + (int(rc.Bottom-rc.Top)-h)/2
+		// 开屏高度锁定解除：允许用户之后把窗口拖小，内容由 ScrollView 兜底
+		dlg.SetMinMaxSizePixels(walk.Size{
+			Width:  dlg.IntFrom96DPI(480),
+			Height: dlg.IntFrom96DPI(floorH96),
+		}, walk.Size{})
+		if w != b.Width || h != b.Height || x != b.X || y != b.Y {
+			_ = dlg.SetBoundsPixels(walk.Rectangle{X: x, Y: y, Width: w, Height: h})
+		}
+	})
+}
+
+// presentResultDialog 意图分析结果窗公共外壳（本地/远程两种数据来源共用）。
+// body 为滚动区内的卡片控件；confidenceVal < 0 表示不显示置信度行。
+func presentResultDialog(contactID int64, body []dl.Widget, confidenceVal int) {
+	var dlg *walk.Dialog
+	var confidencePB *walk.ProgressBar
+
+	if confidenceVal >= 0 {
+		body = append(body, dl.Composite{
+			Layout: dl.HBox{MarginsZero: true, Spacing: 8},
+			Children: []dl.Widget{
+				dl.Label{Text: "置信度:", Font: fontSection},
+				dl.ProgressBar{AssignTo: &confidencePB, MinSize: dl.Size{Width: 200, Height: 20}},
+				dl.Label{Text: confidenceText(confidenceVal), Font: fontBody},
+			},
+		})
+	}
+
+	bottomBar := []dl.Widget{
+		dl.HSpacer{},
+		dl.PushButton{
+			Text:    "查看完整画像",
+			MinSize: dl.Size{Width: 120, Height: 32},
+			OnClicked: func() {
+				dlg.Cancel()
+				ShowProfileWindow(contactID)
+			},
+		},
+		dl.PushButton{
+			Text:      "关闭",
+			MinSize:   dl.Size{Width: 80, Height: 32},
+			OnClicked: func() { dlg.Cancel() },
+		},
+	}
+
+	var sv *walk.ScrollView
+	dlg, sv = createFitDialog("意图分析结果", 680, 820, body, bottomBar)
+	if dlg == nil {
+		return
+	}
+	setTopMost(dlg.Handle())
+	armAutoFitScroll(dlg, sv, 680, 360)
+
+	if confidencePB != nil && confidenceVal > 0 {
+		confidencePB.SetValue(confidenceVal)
+	}
+	dlg.Run()
+}
+
 func appendPopupItem(hMenu win.HMENU, id uintptr, text string) {
 	ptr, _ := syscall.UTF16PtrFromString(text)
 	procAppendMenuW.Call(uintptr(hMenu), 0x0, id, uintptr(unsafe.Pointer(ptr)))
@@ -106,23 +285,24 @@ func SetupFloatingWindow() error {
 	if err := (dl.MainWindow{
 		AssignTo: &mainWindow,
 		Title:    "画像助手",
-		Size:     dl.Size{Width: 150, Height: 96},
-		MinSize:  dl.Size{Width: 150, Height: 96},
-		MaxSize:  dl.Size{Width: 150, Height: 96},
-		Layout:   dl.VBox{MarginsZero: true, Spacing: 2},
+		// 浮窗刻意做小：120×80（96dpi 逻辑尺寸，高 DPI 屏由 walk 自动放大）
+		Size:    dl.Size{Width: 120, Height: 80},
+		MinSize: dl.Size{Width: 120, Height: 80},
+		MaxSize: dl.Size{Width: 120, Height: 80},
+		Layout:  dl.VBox{MarginsZero: true, Spacing: 2},
 		Children: []dl.Widget{
 			dl.PushButton{
 				AssignTo:  &identifyBtn,
 				Text:      "识 别",
-				Font:      fontTitle,
-				MinSize:   dl.Size{Width: 140, Height: 36},
+				Font:      fontSection,
+				MinSize:   dl.Size{Width: 110, Height: 26},
 				OnClicked: onIdentifyClicked,
 			},
 			dl.PushButton{
 				AssignTo: &profileBtn,
 				Text:     "画 像",
 				Font:     fontBody,
-				MinSize:  dl.Size{Width: 140, Height: 28},
+				MinSize:  dl.Size{Width: 110, Height: 22},
 				OnClicked: func() {
 					ShowProfileWindow(0)
 				},
@@ -185,18 +365,24 @@ func applyFloatingStyle(hwnd win.HWND) {
 	win.SetWindowPos(hwnd, win.HWND(0), 0, 0, 0, 0,
 		win.SWP_NOMOVE|win.SWP_NOSIZE|win.SWP_NOZORDER|win.SWP_FRAMECHANGED)
 
-	const winW, winH = 150, 96
-	cx := win.GetSystemMetrics(win.SM_CXSCREEN)
-	cy := win.GetSystemMetrics(win.SM_CYSCREEN)
-	x := cx - winW - 20
+	// 逻辑尺寸（96dpi）换算到当前显示器的物理像素；
+	// DPI 感知生效前进程会被系统位图拉伸，窗口会异常巨大且发虚，
+	// 声明 PerMonitorV2 后这里拿到的才是真实物理分辨率。
+	const winW96, winH96, margin96 = 120, 80, 20
+	winW := mainWindow.IntFrom96DPI(winW96)
+	winH := mainWindow.IntFrom96DPI(winH96)
+	margin := mainWindow.IntFrom96DPI(margin96)
+	cx := int(win.GetSystemMetrics(win.SM_CXSCREEN))
+	cy := int(win.GetSystemMetrics(win.SM_CYSCREEN))
+	x := cx - winW - margin
 	y := cy * 2 / 3
 	if y+winH > cy {
-		y = cy - winH - 20
+		y = cy - winH - margin
 	}
 	if y < 0 {
 		y = 0
 	}
-	win.SetWindowPos(hwnd, win.HWND_TOPMOST, x, y, winW, winH, win.SWP_NOACTIVATE)
+	win.SetWindowPos(hwnd, win.HWND_TOPMOST, int32(x), int32(y), int32(winW), int32(winH), win.SWP_NOACTIVATE)
 }
 
 // bindFloatingEvents 左键拖动 + 右键菜单
@@ -421,13 +607,10 @@ func confidenceText(v int) string {
 	return fmt.Sprintf("%d%%", v)
 }
 
-// ShowResultWindow 弹出意图分析结果窗口（卡片式布局）
+// ShowResultWindow 弹出意图分析结果窗口（卡片式布局）。
+// 卡片 TextEdit 全部 CompactHeight：按文字行数自己撑高，窗口再由
+// presentResultDialog 按内容总高开到刚好显示全，不再需要手动拖长。
 func ShowResultWindow(contactID int64, contactName string, newCount int, viaAlias bool, result map[string]interface{}, analysisErr error) {
-	var dlg *walk.Dialog
-	var summaryLabel *walk.Label
-	var confidencePB *walk.ProgressBar
-	var confidenceLabel *walk.Label
-
 	// -1 表示这次没有置信度可显示（分析失败或模型没给）
 	confidenceVal := -1
 
@@ -438,159 +621,98 @@ func ShowResultWindow(contactID int64, contactName string, newCount int, viaAlia
 		headerText = fmt.Sprintf("%s · 本次新增 %d 条", contactName, newCount)
 	}
 
-	children := []dl.Widget{
-		dl.Label{
-			AssignTo: &summaryLabel,
-			Text:     headerText,
-			Font:     fontTitle,
-		},
+	body := []dl.Widget{
+		dl.Label{Text: headerText, Font: fontTitle},
 	}
 
 	if analysisErr != nil {
-		children = append(children,
+		body = append(body,
 			dl.GroupBox{
 				Title:  "分析失败",
 				Layout: dl.VBox{MarginsZero: true},
 				Children: []dl.Widget{
 					dl.TextEdit{
-						ReadOnly: true,
-						VScroll:  true,
-						Text:     analysisErr.Error(),
-						MinSize:  dl.Size{Width: 600, Height: 200},
+						ReadOnly:      true,
+						CompactHeight: true,
+						Text:          analysisErr.Error(),
 					},
 				},
 			},
 		)
-	} else {
-		// 五个固定卡片
-		cardKeys := []struct {
-			title string
-			key   string
-		}{
-			{"表面意思", "surface"},
-			{"潜在意图", "intent"},
-			{"情绪状态", "emotion"},
-			{"潜台词", "subtext"},
-		}
-		for i, reply := range suggestedReplyItems(result) {
-			key := fmt.Sprintf("suggested_reply_%d", i)
-			result[key] = reply.Text
-			cardKeys = append(cardKeys, struct{ title, key string }{reply.Style, key})
-		}
+		presentResultDialog(contactID, body, confidenceVal)
+		return
+	}
 
-		for _, c := range cardKeys {
+	// 四个分析卡片 + N 条建议回复卡片
+	cardKeys := []struct {
+		title string
+		key   string
+	}{
+		{"表面意思", "surface"},
+		{"潜在意图", "intent"},
+		{"情绪状态", "emotion"},
+		{"潜台词", "subtext"},
+	}
+	for i, reply := range suggestedReplyItems(result) {
+		key := fmt.Sprintf("suggested_reply_%d", i)
+		result[key] = reply.Text
+		cardKeys = append(cardKeys, struct{ title, key string }{reply.Style, key})
+	}
+
+	for _, c := range cardKeys {
+		content := fieldString(result, c.key)
+		if strings.HasPrefix(c.key, "suggested_reply_") {
 			var suggestionTE *walk.TextEdit
-			content := fieldString(result, c.key)
-			if strings.HasPrefix(c.key, "suggested_reply_") {
-				controls := rewriteControls(contactID, &suggestionTE)
-				children = append(children, controls,
-					dl.GroupBox{
-						Title:  c.title,
-						Layout: dl.VBox{MarginsZero: true, Spacing: 4},
-						Children: []dl.Widget{
-							dl.Composite{
-								Layout: dl.HBox{MarginsZero: true, Spacing: 4},
-								Children: []dl.Widget{
-									dl.TextEdit{
-										AssignTo: &suggestionTE,
-										ReadOnly: true,
-										VScroll:  true,
-										Text:     content,
-										MinSize:  dl.Size{Width: 500, Height: 64},
-									},
-									dl.PushButton{
-										Text:    "复制",
-										MinSize: dl.Size{Width: 60, Height: 28},
-										OnClicked: func() {
-											if suggestionTE != nil {
-												_ = clipboard.WriteAll(suggestionTE.Text())
-											}
-										},
+			controls := rewriteControls(contactID, &suggestionTE)
+			body = append(body, controls,
+				dl.GroupBox{
+					Title:  c.title,
+					Layout: dl.VBox{MarginsZero: true, Spacing: 4},
+					Children: []dl.Widget{
+						dl.Composite{
+							Layout: dl.HBox{MarginsZero: true, Spacing: 4},
+							Children: []dl.Widget{
+								dl.TextEdit{
+									AssignTo:      &suggestionTE,
+									ReadOnly:      true,
+									CompactHeight: true,
+									Text:          content,
+								},
+								dl.PushButton{
+									Text:    "复制",
+									MinSize: dl.Size{Width: 60, Height: 28},
+									OnClicked: func() {
+										if suggestionTE != nil {
+											_ = clipboard.WriteAll(suggestionTE.Text())
+										}
 									},
 								},
 							},
 						},
 					},
-				)
-			} else {
-				children = append(children,
-					dl.GroupBox{
-						Title:  c.title,
-						Layout: dl.VBox{MarginsZero: true},
-						Children: []dl.Widget{
-							dl.TextEdit{
-								ReadOnly: true,
-								VScroll:  true,
-								Text:     content,
-								MinSize:  dl.Size{Width: 600, Height: 54},
-							},
+				},
+			)
+		} else {
+			body = append(body,
+				dl.GroupBox{
+					Title:  c.title,
+					Layout: dl.VBox{MarginsZero: true},
+					Children: []dl.Widget{
+						dl.TextEdit{
+							ReadOnly:      true,
+							CompactHeight: true,
+							Text:          content,
 						},
 					},
-				)
-			}
-		}
-
-		// 置信度：标签初值就必须是格式化好的百分比，
-		// 否则模型没给置信度时界面上会一直停着原始的 "0.85"。
-		confidenceVal = parseConfidence(fieldString(result, "confidence"))
-		children = append(children,
-			dl.Composite{
-				Layout: dl.HBox{MarginsZero: true, Spacing: 8},
-				Children: []dl.Widget{
-					dl.Label{Text: "置信度:", Font: fontSection},
-					dl.ProgressBar{
-						AssignTo: &confidencePB,
-						MinSize:  dl.Size{Width: 200, Height: 20},
-					},
-					dl.Label{AssignTo: &confidenceLabel, Text: confidenceText(confidenceVal), Font: fontBody},
 				},
-			},
-		)
-	}
-
-	children = append(children,
-		dl.Composite{
-			Layout: dl.HBox{MarginsZero: true},
-			Children: []dl.Widget{
-				dl.HSpacer{},
-				dl.PushButton{
-					Text:    "查看完整画像",
-					MinSize: dl.Size{Width: 120, Height: 32},
-					OnClicked: func() {
-						dlg.Cancel()
-						ShowProfileWindow(contactID)
-					},
-				},
-				dl.PushButton{
-					Text:      "关闭",
-					MinSize:   dl.Size{Width: 80, Height: 32},
-					OnClicked: func() { dlg.Cancel() },
-				},
-			},
-		},
-	)
-
-	if err := (dl.Dialog{
-		AssignTo: &dlg,
-		Title:    "意图分析结果",
-		MinSize:  dl.Size{Width: 480, Height: 400},
-		Size:     dl.Size{Width: 680, Height: 820},
-		Layout:   dl.VBox{Spacing: 8},
-		Children: []dl.Widget{dl.ScrollView{Layout: dl.VBox{Spacing: 8}, Children: children}},
-	}).Create(mainWindow); err != nil {
-		showError("创建结果窗口失败: " + err.Error())
-		return
-	}
-	setTopMost(dlg.Handle())
-	makeDialogResizable(dlg)
-
-	// 进度条只认 0~100；没有置信度时停在 0，文案由 confidenceText 统一显示"暂无"
-	if confidencePB != nil {
-		if confidenceVal > 0 {
-			confidencePB.SetValue(confidenceVal)
+			)
 		}
 	}
-	dlg.Run()
+
+	// 置信度：标签初值就必须是格式化好的百分比，
+	// 否则模型没给置信度时界面上会一直停着原始的 "0.85"。
+	confidenceVal = parseConfidence(fieldString(result, "confidence"))
+	presentResultDialog(contactID, body, confidenceVal)
 }
 
 // ---------------- 画像主窗口的表格模型 ----------------

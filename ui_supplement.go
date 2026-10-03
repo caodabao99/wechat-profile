@@ -27,6 +27,7 @@ func showEditProfileDialog(id int64, onDone func()) {
 	}
 	var dlg *walk.Dialog
 	var saveBtn, cancelBtn *walk.PushButton
+	var sv *walk.ScrollView
 	var saving bool
 	var widgets []dl.Widget
 	var collectors []func() error
@@ -48,7 +49,10 @@ func showEditProfileDialog(id int64, onDone func()) {
 		var te *walk.TextEdit
 		widgets = append(widgets, dl.TextEdit{
 			AssignTo: &te, Text: val, VScroll: true, Font: fontBody,
-			MinSize: dl.Size{Height: height},
+			// CompactHeight：高度按文字行数自适应，长概要不再被固定高度裁切；
+			// height 仅作为空字段时的最小高度兜底
+			CompactHeight: true,
+			MinSize:       dl.Size{Height: height},
 		})
 		collectors = append(collectors, func() error {
 			*target = strings.TrimSpace(te.Text())
@@ -69,7 +73,8 @@ func showEditProfileDialog(id int64, onDone func()) {
 		var te *walk.TextEdit
 		widgets = append(widgets, dl.TextEdit{
 			AssignTo: &te, Text: strings.Join(vals, "\r\n"), VScroll: true, Font: fontBody,
-			MinSize: dl.Size{Height: height},
+			CompactHeight: true,
+			MinSize:       dl.Size{Height: height},
 		})
 		collectors = append(collectors, func() error {
 			items := []string{}
@@ -134,7 +139,8 @@ func showEditProfileDialog(id int64, onDone func()) {
 	var intentTE *walk.TextEdit
 	widgets = append(widgets, dl.TextEdit{
 		AssignTo: &intentTE, Text: strings.Join(intentLines, "\r\n"), VScroll: true, Font: fontBody,
-		MinSize: dl.Size{Height: 90},
+		CompactHeight: true,
+		MinSize:       dl.Size{Height: 90},
 	})
 	collectors = append(collectors, func() error {
 		items := map[string]string{}
@@ -168,7 +174,8 @@ func showEditProfileDialog(id int64, onDone func()) {
 		MinSize: dl.Size{Width: 480, Height: 360}, Size: dl.Size{Width: 720, Height: 820},
 		Layout: dl.VBox{Spacing: 6}, Children: []dl.Widget{
 			dl.Label{Text: "分节与画像页一致；清空字段或列表项即可删除，再次 AI 生成可能重新提取。", Font: fontHint},
-			dl.ScrollView{Layout: dl.VBox{Spacing: 4}, Children: widgets},
+			// 关掉横向滚动：字段宽度全部自适应窗口，不再撑出横向滚动条
+			dl.ScrollView{AssignTo: &sv, HorizontalFixed: true, Layout: dl.VBox{Spacing: 4}, Children: widgets},
 			dl.Composite{Layout: dl.HBox{}, Children: []dl.Widget{
 				dl.PushButton{AssignTo: &saveBtn, Text: "保存", OnClicked: func() {
 					for _, get := range collectors {
@@ -207,7 +214,8 @@ func showEditProfileDialog(id int64, onDone func()) {
 		return
 	}
 	setTopMost(dlg.Handle())
-	makeDialogResizable(dlg)
+	// 开屏自动开到能完整显示 9 节内容的高度（屏幕放不下时钳制，内部滚动兜底）
+	armAutoFitScroll(dlg, sv, 720, 360)
 	dlg.Closing().Attach(func(canceled *bool, reason walk.CloseReason) {
 		if saving {
 			*canceled = true

@@ -6,4 +6,13 @@
         version="6.0.0.0" processorArchitecture="*" publicKeyToken="6595b64144ccf1df" language="*"/>
     </dependentAssembly>
   </dependency>
+  <!-- Per-Monitor V2 DPI 感知：walk 会按屏幕真实 DPI 自动缩放界面。
+       不声明时进程在高缩放屏幕上被 Windows 位图拉伸（发糊、悬浮窗被放大数倍）。
+       dpiAware 是 Vista~Win8.1 的旧版回退声明，PerMonitorV2 用于 Win10 1703+。 -->
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2,PerMonitor</dpiAwareness>
+    </windowsSettings>
+  </application>
 </assembly>

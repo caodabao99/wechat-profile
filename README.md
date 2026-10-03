@@ -25,9 +25,9 @@
 
 ### 方式一：直接下载（推荐）
 
-去 [Releases](https://github.com/caodabao99/wechat-profile/releases) 页面下载最新版 `wechat-profile-v2.3.1.zip`，解压到任意目录。
+去 [Releases](https://github.com/caodabao99/wechat-profile/releases) 页面下载最新版 `wechat-profile-v2.3.2.zip`，解压到任意目录。
 
-> 同一个 Release 页面还附带服务端包 `wechat-profile-bot-v2.3.1.zip`（用「远程模式」时才需要），服务端的 Linux/Windows/Docker 部署说明见 [wechat-profile-bot](https://github.com/caodabao99/wechat-profile-bot)。
+> 同一个 Release 页面还附带服务端包 `wechat-profile-bot-v2.3.2.zip` 和 Docker 镜像 `wechat-profile-bot-docker-v2.3.2.tar.gz`（用「远程模式」时才需要），服务端的 Linux/Windows/Docker 部署说明见 [wechat-profile-bot](https://github.com/caodabao99/wechat-profile-bot)。
 
 ### 方式二：自行编译
 
@@ -216,6 +216,16 @@ Linux/macOS 下交叉编译可直接执行 `./build.sh`，产物输出到 `dist/
 4. 微信版本更新若导致复制格式变化，解析器内置降级逻辑（整段文本按对方消息处理），但消息时间与发言人识别可能失效，需按新版格式调整 `parser.go` 中的正则。
 
 ## 更新日志
+
+### v2.3.2（2026-10-03）
+
+显示修复专项，升级只需替换 exe。
+
+- **高 DPI 屏显示修复**：程序清单声明 PerMonitorV2 DPI 感知，高分辨率/系统缩放屏上不再被 Windows 整体位图拉伸——这是此前「识别浮窗变得巨大发糊、界面发虚」的根因
+- **弹窗按内容自适应开窗**：「意图分析结果」「编辑画像」开屏自动开到刚好完整显示内容的高度并居中，屏幕放不下时钳制到工作区高度、内容内部滚动，不用再手动拖长窗口
+- **文本框按内容撑高**：意图分析各卡片、编辑画像 17 个字段全部改为随文字行数自动撑高，长概要不再被固定高度裁切
+- **结果窗底部按钮常驻**：「查看完整画像 / 关闭」移出滚动区固定在底部；横向滚动条彻底移除，内容按窗口宽度自动换行
+- **识别浮窗缩小**：150×96 → 120×80，按钮与字号同步缩小，屏幕定位按 DPI 正确缩放
 
 ### v2.3.1（2026-10-03）
 

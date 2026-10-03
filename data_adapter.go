@@ -477,13 +477,9 @@ func doGetMergeCandidates(excludeID int64) ([]Contact, error) {
 	return GetMergeCandidates(db, excludeID)
 }
 
-// ShowResultWindowRemote 远程模式的结果窗口（从 API 返回的数据直接展示）
+// ShowResultWindowRemote 远程模式的结果窗口（从 API 返回的数据直接展示）。
+// 布局与本地 ShowResultWindow 一致：CompactHeight 卡片 + 按内容自动开窗。
 func ShowResultWindowRemote(result *IngestResult) {
-	var dlg *walk.Dialog
-	var summaryLabel *walk.Label
-	var confidencePB *walk.ProgressBar
-	var confidenceLabel *walk.Label
-
 	// -1 表示这次没有置信度可显示
 	confidenceVal := -1
 
@@ -498,154 +494,100 @@ func ShowResultWindowRemote(result *IngestResult) {
 		headerText += " · 画像更新中"
 	}
 
-	children := []dl.Widget{
-		dl.Label{
-			AssignTo: &summaryLabel,
-			Text:     headerText,
-			Font:     fontTitle,
-		},
+	body := []dl.Widget{
+		dl.Label{Text: headerText, Font: fontTitle},
 	}
 
 	// 意图分析结果
 	if result.IntentError != "" {
-		children = append(children,
+		body = append(body,
 			dl.GroupBox{
 				Title:  "分析失败",
 				Layout: dl.VBox{MarginsZero: true},
 				Children: []dl.Widget{
 					dl.TextEdit{
-						ReadOnly: true,
-						VScroll:  true,
-						Text:     result.IntentError,
-						MinSize:  dl.Size{Width: 600, Height: 200},
+						ReadOnly:      true,
+						CompactHeight: true,
+						Text:          result.IntentError,
 					},
 				},
 			},
 		)
-	} else if result.Intent != nil {
-		cardKeys := []struct {
-			title string
-			key   string
-		}{
-			{"表面意思", "surface"},
-			{"潜在意图", "intent"},
-			{"情绪状态", "emotion"},
-			{"潜台词", "subtext"},
-		}
-		for i, reply := range suggestedReplyItems(result.Intent) {
-			key := fmt.Sprintf("suggested_reply_%d", i)
-			result.Intent[key] = reply.Text
-			cardKeys = append(cardKeys, struct{ title, key string }{reply.Style, key})
-		}
+		presentResultDialog(result.ContactID, body, confidenceVal)
+		return
+	}
 
-		for _, c := range cardKeys {
+	if result.Intent == nil {
+		presentResultDialog(result.ContactID, body, confidenceVal)
+		return
+	}
+
+	cardKeys := []struct {
+		title string
+		key   string
+	}{
+		{"表面意思", "surface"},
+		{"潜在意图", "intent"},
+		{"情绪状态", "emotion"},
+		{"潜台词", "subtext"},
+	}
+	for i, reply := range suggestedReplyItems(result.Intent) {
+		key := fmt.Sprintf("suggested_reply_%d", i)
+		result.Intent[key] = reply.Text
+		cardKeys = append(cardKeys, struct{ title, key string }{reply.Style, key})
+	}
+
+	for _, c := range cardKeys {
+		content := fieldString(result.Intent, c.key)
+		if strings.HasPrefix(c.key, "suggested_reply_") {
 			var suggestionTE *walk.TextEdit
-			content := fieldString(result.Intent, c.key)
-			if strings.HasPrefix(c.key, "suggested_reply_") {
-				controls := rewriteControls(result.ContactID, &suggestionTE)
-				children = append(children, controls,
-					dl.GroupBox{
-						Title:  c.title,
-						Layout: dl.VBox{MarginsZero: true, Spacing: 4},
-						Children: []dl.Widget{
-							dl.Composite{
-								Layout: dl.HBox{MarginsZero: true, Spacing: 4},
-								Children: []dl.Widget{
-									dl.TextEdit{
-										AssignTo: &suggestionTE,
-										ReadOnly: true,
-										VScroll:  true,
-										Text:     content,
-										MinSize:  dl.Size{Width: 500, Height: 64},
-									},
-									dl.PushButton{
-										Text:    "复制",
-										MinSize: dl.Size{Width: 60, Height: 28},
-										OnClicked: func() {
-											if suggestionTE != nil {
-												_ = clipboard.WriteAll(suggestionTE.Text())
-											}
-										},
+			controls := rewriteControls(result.ContactID, &suggestionTE)
+			body = append(body, controls,
+				dl.GroupBox{
+					Title:  c.title,
+					Layout: dl.VBox{MarginsZero: true, Spacing: 4},
+					Children: []dl.Widget{
+						dl.Composite{
+							Layout: dl.HBox{MarginsZero: true, Spacing: 4},
+							Children: []dl.Widget{
+								dl.TextEdit{
+									AssignTo:      &suggestionTE,
+									ReadOnly:      true,
+									CompactHeight: true,
+									Text:          content,
+								},
+								dl.PushButton{
+									Text:    "复制",
+									MinSize: dl.Size{Width: 60, Height: 28},
+									OnClicked: func() {
+										if suggestionTE != nil {
+											_ = clipboard.WriteAll(suggestionTE.Text())
+										}
 									},
 								},
 							},
 						},
 					},
-				)
-			} else {
-				children = append(children,
-					dl.GroupBox{
-						Title:  c.title,
-						Layout: dl.VBox{MarginsZero: true},
-						Children: []dl.Widget{
-							dl.TextEdit{
-								ReadOnly: true,
-								VScroll:  true,
-								Text:     content,
-								MinSize:  dl.Size{Width: 600, Height: 54},
-							},
+				},
+			)
+		} else {
+			body = append(body,
+				dl.GroupBox{
+					Title:  c.title,
+					Layout: dl.VBox{MarginsZero: true},
+					Children: []dl.Widget{
+						dl.TextEdit{
+							ReadOnly:      true,
+							CompactHeight: true,
+							Text:          content,
 						},
 					},
-				)
-			}
+				},
+			)
 		}
-
-		// 置信度：标签初值就是格式化好的百分比，别把原始的 "0.85" 露给用户
-		confidenceVal = parseConfidence(fieldString(result.Intent, "confidence"))
-		children = append(children,
-			dl.Composite{
-				Layout: dl.HBox{MarginsZero: true, Spacing: 8},
-				Children: []dl.Widget{
-					dl.Label{Text: "置信度:", Font: fontSection},
-					dl.ProgressBar{
-						AssignTo: &confidencePB,
-						MinSize:  dl.Size{Width: 200, Height: 20},
-					},
-					dl.Label{AssignTo: &confidenceLabel, Text: confidenceText(confidenceVal), Font: fontBody},
-				},
-			},
-		)
 	}
 
-	children = append(children,
-		dl.Composite{
-			Layout: dl.HBox{MarginsZero: true},
-			Children: []dl.Widget{
-				dl.HSpacer{},
-				dl.PushButton{
-					Text:    "查看完整画像",
-					MinSize: dl.Size{Width: 120, Height: 32},
-					OnClicked: func() {
-						dlg.Cancel()
-						ShowProfileWindow(result.ContactID)
-					},
-				},
-				dl.PushButton{
-					Text:      "关闭",
-					MinSize:   dl.Size{Width: 80, Height: 32},
-					OnClicked: func() { dlg.Cancel() },
-				},
-			},
-		},
-	)
-
-	if err := (dl.Dialog{
-		AssignTo: &dlg,
-		Title:    "意图分析结果",
-		MinSize:  dl.Size{Width: 480, Height: 400},
-		Size:     dl.Size{Width: 680, Height: 820},
-		Layout:   dl.VBox{Spacing: 8},
-		Children: []dl.Widget{dl.ScrollView{Layout: dl.VBox{Spacing: 8}, Children: children}},
-	}).Create(mainWindow); err != nil {
-		showError("创建结果窗口失败: " + err.Error())
-		return
-	}
-	setTopMost(dlg.Handle())
-	makeDialogResizable(dlg)
-
-	// 进度条只认 0~100；没有置信度时停在 0，文案由 confidenceText 统一显示"暂无"
-	if confidencePB != nil && confidenceVal > 0 {
-		confidencePB.SetValue(confidenceVal)
-	}
-	dlg.Run()
+	// 置信度：标签初值就是格式化好的百分比，别把原始的 "0.85" 露给用户
+	confidenceVal = parseConfidence(fieldString(result.Intent, "confidence"))
+	presentResultDialog(result.ContactID, body, confidenceVal)
 }
