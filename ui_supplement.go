@@ -41,16 +41,16 @@ func showEditProfileDialog(id int64, onDone func()) {
 	hint := func(text string) {
 		widgets = append(widgets, dl.Label{Text: text, Font: fontHint})
 	}
-	// 单值文本字段：label 为空表示整节就是一个段落（概要）
-	strField := func(label string, val string, target *string, height int) {
+	// 单值文本字段：label 为空表示整节就是一个段落（概要）。
+	// CompactHeight：高度按文字在当前宽度下的换行行数精确撑开，不裁切、
+	// 无内部滚动条；手动输入换行时高度自动增长。空字段为一行高。
+	strField := func(label string, val string, target *string) {
 		if label != "" {
 			widgets = append(widgets, dl.Label{Text: label, Font: fontBody})
 		}
 		var te *walk.TextEdit
 		widgets = append(widgets, dl.TextEdit{
-			AssignTo: &te, Text: val, VScroll: true, Font: fontBody,
-			// 固定高度 + 内部滚动：高度只由 MinSize 决定，文字不会被拦腰截断
-			MinSize: dl.Size{Height: height},
+			AssignTo: &te, Text: val, CompactHeight: true, Font: fontBody,
 		})
 		collectors = append(collectors, func() error {
 			*target = strings.TrimSpace(te.Text())
@@ -58,7 +58,7 @@ func showEditProfileDialog(id int64, onDone func()) {
 		})
 	}
 	// 列表字段：每行一项；setter 单独传入，兼容 ImportantDates 这类自定义切片类型
-	listField := func(label, note string, vals []string, set func([]string), height int) {
+	listField := func(label, note string, vals []string, set func([]string)) {
 		if label != "" {
 			text := label
 			if note != "" {
@@ -70,8 +70,7 @@ func showEditProfileDialog(id int64, onDone func()) {
 		}
 		var te *walk.TextEdit
 		widgets = append(widgets, dl.TextEdit{
-			AssignTo: &te, Text: strings.Join(vals, "\r\n"), VScroll: true, Font: fontBody,
-			MinSize: dl.Size{Height: height},
+			AssignTo: &te, Text: strings.Join(vals, "\r\n"), CompactHeight: true, Font: fontBody,
 		})
 		collectors = append(collectors, func() error {
 			items := []string{}
@@ -87,40 +86,40 @@ func showEditProfileDialog(id int64, onDone func()) {
 
 	// 1. 概要
 	section("概要")
-	strField("", profile.Summary, &profile.Summary, 50)
+	strField("", profile.Summary, &profile.Summary)
 	// 2. 基本信息
 	section("基本信息")
-	strField("职业", profile.BasicInfo.Occupation, &profile.BasicInfo.Occupation, 30)
-	strField("所在地", profile.BasicInfo.Location, &profile.BasicInfo.Location, 30)
+	strField("职业", profile.BasicInfo.Occupation, &profile.BasicInfo.Occupation)
+	strField("所在地", profile.BasicInfo.Location, &profile.BasicInfo.Location)
 	listField("重要日子", "每行一项", []string(profile.BasicInfo.ImportantDates),
-		func(x []string) { profile.BasicInfo.ImportantDates = ImportantDates(x) }, 60)
+		func(x []string) { profile.BasicInfo.ImportantDates = ImportantDates(x) })
 	// 3. 性格特征
 	section("性格特征")
-	listField("", "每行一项", profile.Personality, func(x []string) { profile.Personality = x }, 70)
+	listField("", "每行一项", profile.Personality, func(x []string) { profile.Personality = x })
 	// 4. 沟通风格
 	section("沟通风格")
-	strField("回复长短", profile.CommunicationStyle.ReplyLength, &profile.CommunicationStyle.ReplyLength, 30)
-	strField("语气", profile.CommunicationStyle.Tone, &profile.CommunicationStyle.Tone, 30)
+	strField("回复长短", profile.CommunicationStyle.ReplyLength, &profile.CommunicationStyle.ReplyLength)
+	strField("语气", profile.CommunicationStyle.Tone, &profile.CommunicationStyle.Tone)
 	listField("口头禅", "每行一项", profile.CommunicationStyle.FrequentPhrases,
-		func(x []string) { profile.CommunicationStyle.FrequentPhrases = x }, 60)
-	strField("表情使用", profile.CommunicationStyle.EmojiUsage, &profile.CommunicationStyle.EmojiUsage, 30)
-	strField("主动程度", profile.CommunicationStyle.Initiative, &profile.CommunicationStyle.Initiative, 30)
+		func(x []string) { profile.CommunicationStyle.FrequentPhrases = x })
+	strField("表情使用", profile.CommunicationStyle.EmojiUsage, &profile.CommunicationStyle.EmojiUsage)
+	strField("主动程度", profile.CommunicationStyle.Initiative, &profile.CommunicationStyle.Initiative)
 	// 5. 兴趣爱好
 	section("兴趣爱好")
-	listField("", "每行一项", profile.Interests, func(x []string) { profile.Interests = x }, 70)
+	listField("", "每行一项", profile.Interests, func(x []string) { profile.Interests = x })
 	// 6. 情绪模式
 	section("情绪模式")
 	listField("压力源", "每行一项", profile.EmotionalPatterns.Stressors,
-		func(x []string) { profile.EmotionalPatterns.Stressors = x }, 60)
+		func(x []string) { profile.EmotionalPatterns.Stressors = x })
 	listField("安慰有效话题", "每行一项", profile.EmotionalPatterns.ComfortTopics,
-		func(x []string) { profile.EmotionalPatterns.ComfortTopics = x }, 60)
-	strField("不高兴时的表现", profile.EmotionalPatterns.WhenUpset, &profile.EmotionalPatterns.WhenUpset, 45)
+		func(x []string) { profile.EmotionalPatterns.ComfortTopics = x })
+	strField("不高兴时的表现", profile.EmotionalPatterns.WhenUpset, &profile.EmotionalPatterns.WhenUpset)
 	// 7. 关系
 	section("关系")
-	strField("亲密程度", profile.Relationship.Closeness, &profile.Relationship.Closeness, 30)
+	strField("亲密程度", profile.Relationship.Closeness, &profile.Relationship.Closeness)
 	listField("近期共同事件", "每行一项", profile.Relationship.RecentEvents,
-		func(x []string) { profile.Relationship.RecentEvents = x }, 60)
-	strField("互动模式", profile.Relationship.InteractionPattern, &profile.Relationship.InteractionPattern, 45)
+		func(x []string) { profile.Relationship.RecentEvents = x })
+	strField("互动模式", profile.Relationship.InteractionPattern, &profile.Relationship.InteractionPattern)
 	// 8. 典型意图（map：每行 名称：描述）
 	section("典型意图")
 	intentKeys := make([]string, 0, len(profile.IntentPatterns))
@@ -135,8 +134,7 @@ func showEditProfileDialog(id int64, onDone func()) {
 	hint("每行一条：名称：描述；整行清空即删除")
 	var intentTE *walk.TextEdit
 	widgets = append(widgets, dl.TextEdit{
-		AssignTo: &intentTE, Text: strings.Join(intentLines, "\r\n"), VScroll: true, Font: fontBody,
-		MinSize: dl.Size{Height: 90},
+		AssignTo: &intentTE, Text: strings.Join(intentLines, "\r\n"), CompactHeight: true, Font: fontBody,
 	})
 	collectors = append(collectors, func() error {
 		items := map[string]string{}
@@ -164,7 +162,7 @@ func showEditProfileDialog(id int64, onDone func()) {
 	})
 	// 9. 重要事实
 	section("重要事实")
-	listField("", "每行一项", profile.ImportantFacts, func(x []string) { profile.ImportantFacts = x }, 70)
+	listField("", "每行一项", profile.ImportantFacts, func(x []string) { profile.ImportantFacts = x })
 
 	if err := (dl.Dialog{AssignTo: &dlg, Title: "编辑当前画像",
 		// walk 的 Dialog.Show 按 max(布局最小尺寸, MinSize) 开窗，开屏即 720×820，
@@ -172,8 +170,9 @@ func showEditProfileDialog(id int64, onDone func()) {
 		MinSize: dl.Size{Width: 720, Height: 820}, Size: dl.Size{Width: 720, Height: 820},
 		Layout: dl.VBox{Spacing: 6}, Children: []dl.Widget{
 			dl.Label{Text: "分节与画像页一致；清空字段或列表项即可删除，再次 AI 生成可能重新提取。", Font: fontHint},
-			// 关掉横向滚动：字段宽度全部自适应窗口，不再撑出横向滚动条
-			dl.ScrollView{AssignTo: &sv, HorizontalFixed: true, Layout: dl.VBox{Spacing: 4}, Children: widgets},
+			// ScrollView 不用 HorizontalFixed，宽度撑满窗口；CompactHeight
+			// 字段按宽度换行撑高，正常窗宽下不会出现横向滚动条
+			dl.ScrollView{AssignTo: &sv, Layout: dl.VBox{Spacing: 4}, Children: widgets},
 			dl.Composite{Layout: dl.HBox{}, Children: []dl.Widget{
 				dl.PushButton{AssignTo: &saveBtn, Text: "保存", OnClicked: func() {
 					for _, get := range collectors {

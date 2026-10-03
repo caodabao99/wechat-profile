@@ -478,7 +478,8 @@ func doGetMergeCandidates(excludeID int64) ([]Contact, error) {
 }
 
 // ShowResultWindowRemote 远程模式的结果窗口（从 API 返回的数据直接展示）。
-// 布局与本地 ShowResultWindow 一致：固定高度卡片 + 内部滚动，靠右开窗。
+// 布局与本地 ShowResultWindow 一致：CompactHeight 卡片按宽度自适应高度，
+// 无内部滚动条，ScrollView 宽度撑满窗口。
 func ShowResultWindowRemote(result *IngestResult) {
 	// -1 表示这次没有置信度可显示
 	confidenceVal := -1
@@ -506,10 +507,9 @@ func ShowResultWindowRemote(result *IngestResult) {
 				Layout: dl.VBox{MarginsZero: true},
 				Children: []dl.Widget{
 					dl.TextEdit{
-						ReadOnly: true,
-						VScroll:  true,
-						Text:     result.IntentError,
-						MinSize:  dl.Size{Height: 100},
+						ReadOnly:      true,
+						CompactHeight: true,
+						Text:          result.IntentError,
 					},
 				},
 			},
@@ -552,11 +552,10 @@ func ShowResultWindowRemote(result *IngestResult) {
 							Layout: dl.HBox{MarginsZero: true, Spacing: 4},
 							Children: []dl.Widget{
 								dl.TextEdit{
-									AssignTo: &suggestionTE,
-									ReadOnly: true,
-									VScroll:  true,
-									Text:     content,
-									MinSize:  dl.Size{Height: 56},
+									AssignTo:      &suggestionTE,
+									ReadOnly:      true,
+									CompactHeight: true,
+									Text:          content,
 								},
 								dl.PushButton{
 									Text:    "复制",
@@ -579,10 +578,9 @@ func ShowResultWindowRemote(result *IngestResult) {
 					Layout: dl.VBox{MarginsZero: true},
 					Children: []dl.Widget{
 						dl.TextEdit{
-							ReadOnly: true,
-							VScroll:  true,
-							Text:     content,
-							MinSize:  dl.Size{Height: 72},
+							ReadOnly:      true,
+							CompactHeight: true,
+							Text:          content,
 						},
 					},
 				},

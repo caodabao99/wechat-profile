@@ -75,20 +75,21 @@ func makeDialogResizable(dlg *walk.Dialog) {
 }
 
 // createFitDialog 创建「可滚动内容 + 固定底部按钮行」的弹窗骨架。
-// ScrollView 关闭横向滚动（HorizontalFixed）：内容永远按可用宽度换行，
-// 不会再冒出横向滚动条；宽度超出屏幕的极端情况下才可能裁切。
-// 内部控件一律固定 MinSize 高度 + VScroll：高度只由 MinSize 决定，
-// 文字永远不会拦腰截断，放不下的内容出内部滚动条兜底。
+// ScrollView 不使用 HorizontalFixed：HorizontalFixed 会让 ScrollView 在父布局里
+// 失去水平 Greedy，宽度退化为内容 ideal 宽（CompactHeight 文本框仅约 100px），
+// 窗口右侧大片空白；放开水平滚动后 ScrollView 才会撑满窗口宽度——内部文本框
+// 都按可用宽度换行，正常窗宽下不会真的冒出横向滚动条。
+// 内部 TextEdit 一律 CompactHeight（高度按文字行数精确撑开、不裁切、无内部
+// 滚动条）；内容总高超出窗口时由这里的垂直滚动兜底。
 // 返回 dlg 与 sv，调用方接着调 makeDialogResizable，最后 dlg.Run()。
 func createFitDialog(title string, width96, height96 int, body, bottomBar []dl.Widget) (*walk.Dialog, *walk.ScrollView) {
 	var dlg *walk.Dialog
 	var sv *walk.ScrollView
 	children := []dl.Widget{
 		dl.ScrollView{
-			AssignTo:        &sv,
-			HorizontalFixed: true,
-			Layout:          dl.VBox{Spacing: 8},
-			Children:        body,
+			AssignTo: &sv,
+			Layout:   dl.VBox{Spacing: 8},
+			Children: body,
 		},
 	}
 	if len(bottomBar) > 0 {
@@ -586,10 +587,9 @@ func ShowResultWindow(contactID int64, contactName string, newCount int, viaAlia
 				Layout: dl.VBox{MarginsZero: true},
 				Children: []dl.Widget{
 					dl.TextEdit{
-						ReadOnly: true,
-						VScroll:  true,
-						Text:     analysisErr.Error(),
-						MinSize:  dl.Size{Height: 100},
+						ReadOnly:      true,
+						CompactHeight: true,
+						Text:          analysisErr.Error(),
 					},
 				},
 			},
@@ -628,11 +628,10 @@ func ShowResultWindow(contactID int64, contactName string, newCount int, viaAlia
 							Layout: dl.HBox{MarginsZero: true, Spacing: 4},
 							Children: []dl.Widget{
 								dl.TextEdit{
-									AssignTo: &suggestionTE,
-									ReadOnly: true,
-									VScroll:  true,
-									Text:     content,
-									MinSize:  dl.Size{Height: 56},
+									AssignTo:      &suggestionTE,
+									ReadOnly:      true,
+									CompactHeight: true,
+									Text:          content,
 								},
 								dl.PushButton{
 									Text:    "复制",
@@ -655,10 +654,9 @@ func ShowResultWindow(contactID int64, contactName string, newCount int, viaAlia
 					Layout: dl.VBox{MarginsZero: true},
 					Children: []dl.Widget{
 						dl.TextEdit{
-							ReadOnly: true,
-							VScroll:  true,
-							Text:     content,
-							MinSize:  dl.Size{Height: 72},
+							ReadOnly:      true,
+							CompactHeight: true,
+							Text:          content,
 						},
 					},
 				},
