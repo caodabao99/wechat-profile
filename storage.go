@@ -484,6 +484,74 @@ func GetAllContacts(db *sql.DB, includeMerged bool) ([]Contact, error) {
 	return out, rows.Err()
 }
 
+// GetContactsPage 分页查询联系人，返回当前页数据与符合条件的总数。
+// q 非空时按昵称/备注/别名模糊匹配（LIKE 忽略 ASCII 大小写，中文天然精确）。
+// GetAllContacts 保持全量语义不动（桌面端远程模式在用），网页端改用本函数避免全量渲染。
+func GetContactsPage(db *sql.DB, includeMerged bool, q string, offset, limit int) ([]Contact, int, error) {
+	dbMu.Lock()
+	defer dbMu.Unlock()
+
+	if limit <= 0 {
+		limit = 30
+	}
+	if limit > 200 {
+		limit = 200 // 硬上限，避免一个请求把整库拉走
+	}
+	if offset < 0 {
+		offset = 0
+	}
+
+	where := ""
+	var args []interface{}
+	if !includeMerged {
+		where = ` WHERE c.merged_into IS NULL`
+	}
+	if q = strings.TrimSpace(q); q != "" {
+		like := "%" + q + "%"
+		cond := `(c.name LIKE ? OR COALESCE(c.remark,'') LIKE ?
+			OR EXISTS (SELECT 1 FROM contact_aliases ca WHERE ca.contact_id = c.id AND ca.alias LIKE ?))`
+		if where == "" {
+			where = ` WHERE ` + cond
+		} else {
+			where += ` AND ` + cond
+		}
+		args = append(args, like, like, like)
+	}
+
+	var total int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM contacts c`+where, args...).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+
+	query := `SELECT c.id, c.name, COALESCE(c.remark,''), COALESCE(c.profile_json,'{}'),
+		        COALESCE(c.profile_summary,''), c.other_msg_count,
+		        COALESCE(c.last_updated,''), c.created_at,
+		        COALESCE(c.merged_into, 0),
+		        (SELECT COUNT(*) FROM merge_log ml WHERE ml.target_id = c.id AND ml.undone_at IS NULL)
+		 FROM contacts c` + where +
+		// 排序依据同 GetAllContacts：strftime 转 epoch 再比，避免混入不同时区偏移时字典序出错
+		` ORDER BY strftime('%s', c.last_updated) DESC, c.id DESC LIMIT ? OFFSET ?`
+	args = append(args, limit, offset)
+
+	rows, err := db.Query(query, args...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+
+	out := []Contact{} // 空结果也返回 [] 而非 nil（JSON null），前端才不会白屏
+	for rows.Next() {
+		var c Contact
+		if err := rows.Scan(&c.ID, &c.Name, &c.Remark, &c.ProfileJSON,
+			&c.ProfileSummary, &c.OtherMsgCount, &c.LastUpdated, &c.CreatedAt,
+			&c.MergedInto, &c.MergeCount); err != nil {
+			return nil, 0, err
+		}
+		out = append(out, c)
+	}
+	return out, total, rows.Err()
+}
+
 // GetProfileHistory 取画像变更历史（最新在前）
 func GetProfileHistory(db *sql.DB, contactID int64, limit int) ([]ProfileHistory, error) {
 	dbMu.Lock()

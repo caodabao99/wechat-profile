@@ -12,8 +12,39 @@ import (
 	"unicode/utf8"
 )
 
-var ErrAssistInput = errors.New("文字不能为空且不能超过4000字；改写风格请选择更简短、更自然、更委婉或更直接")
-var rewriteStyles = []string{"更简短", "更自然", "更委婉", "更直接"}
+var ErrAssistInput = errors.New("文字不能为空且不能超过4000字；回复风格请选择稳妥得体、简洁直接、亲切热情或委婉留余地")
+
+// replyStyles 候选回复与「换个说法」共用的一套固定风格。
+// 四种风格在「温度 × 直接度」上两两差异明显，模型能稳定区分，用户也一眼可辨：
+// 稳妥得体=礼貌周全有分寸（默认）；简洁直接=一句话不寒暄；
+// 亲切热情=有温度表达关心；委婉留余地=不把话说死、给对方面子（拒绝/敏感场景）。
+var replyStyles = []string{"稳妥得体", "简洁直接", "亲切热情", "委婉留余地"}
+
+// styleGuide 每种风格的具体要求，拼进 prompt，保证不同风格产出有可感知差异。
+var styleGuide = map[string]string{
+	"稳妥得体":  "礼貌周全、分寸感好，语气自然不生硬，不犯错、不得罪人，适合大多数场合的默认选择",
+	"简洁直接":  "用最少的字把事情说清楚，不寒暄、不铺垫、不用语气词堆砌，一句话能说完就不用两句",
+	"亲切热情":  "带情绪温度，表达关心和在意，可以用语气词和表情式文字拉近距离，像关系好的朋友",
+	"委婉留余地": "不把话说死，给对方面子和台阶，缓冲拒绝、反对或坏消息，语气柔和但态度清楚",
+}
+
+// styleHint 返回风格的 prompt 描述；未知风格回退到稳妥得体。
+func styleHint(style string) string {
+	if g, ok := styleGuide[style]; ok {
+		return g
+	}
+	return styleGuide["稳妥得体"]
+}
+
+// normalizeStyle 校验风格名，非法值回退为稳妥得体。
+func normalizeStyle(style string) string {
+	for _, s := range replyStyles {
+		if style == s {
+			return s
+		}
+	}
+	return "稳妥得体"
+}
 
 type DraftReview struct {
 	Issues   []string `json:"issues"`
@@ -25,7 +56,7 @@ func validateAssist(text, style string, rewrite bool) error {
 		return ErrAssistInput
 	}
 	if rewrite {
-		for _, s := range rewriteStyles {
+		for _, s := range replyStyles {
 			if style == s {
 				return nil
 			}
@@ -56,7 +87,7 @@ func RewriteReply(ctx context.Context, db *sql.DB, llm *LLMClient, id int64, tex
 	if err != nil {
 		return "", err
 	}
-	raw, err := llm.CallContext(ctx, prompt+"\n将原文改写为"+style+"。只输出JSON：{\"reply\":\"改写后的单条回复\"}")
+	raw, err := llm.CallContext(ctx, prompt+"\n将原文改写成「"+style+"」风格："+styleHint(style)+"。保持原意和立场不变，只调整表达方式。只输出JSON：{\"reply\":\"改写后的单条回复\"}")
 	if err != nil {
 		return "", err
 	}

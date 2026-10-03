@@ -517,7 +517,7 @@ func ShowResultWindowRemote(result *IngestResult) {
 						ReadOnly: true,
 						VScroll:  true,
 						Text:     result.IntentError,
-						MinSize:  dl.Size{Width: 480, Height: 200},
+						MinSize:  dl.Size{Width: 600, Height: 200},
 					},
 				},
 			},
@@ -532,10 +532,10 @@ func ShowResultWindowRemote(result *IngestResult) {
 			{"情绪状态", "emotion"},
 			{"潜台词", "subtext"},
 		}
-		for i, reply := range suggestedReplies(result.Intent) {
+		for i, reply := range suggestedReplyItems(result.Intent) {
 			key := fmt.Sprintf("suggested_reply_%d", i)
-			result.Intent[key] = reply
-			cardKeys = append(cardKeys, struct{ title, key string }{fmt.Sprintf("建议回复 %d", i+1), key})
+			result.Intent[key] = reply.Text
+			cardKeys = append(cardKeys, struct{ title, key string }{reply.Style, key})
 		}
 
 		for _, c := range cardKeys {
@@ -556,7 +556,7 @@ func ShowResultWindowRemote(result *IngestResult) {
 										ReadOnly: true,
 										VScroll:  true,
 										Text:     content,
-										MinSize:  dl.Size{Width: 380, Height: 60},
+										MinSize:  dl.Size{Width: 500, Height: 64},
 									},
 									dl.PushButton{
 										Text:    "复制",
@@ -582,7 +582,7 @@ func ShowResultWindowRemote(result *IngestResult) {
 								ReadOnly: true,
 								VScroll:  true,
 								Text:     content,
-								MinSize:  dl.Size{Width: 480, Height: 50},
+								MinSize:  dl.Size{Width: 600, Height: 54},
 							},
 						},
 					},
@@ -632,8 +632,8 @@ func ShowResultWindowRemote(result *IngestResult) {
 	if err := (dl.Dialog{
 		AssignTo: &dlg,
 		Title:    "意图分析结果",
-		MinSize:  dl.Size{Width: 520, Height: 480},
-		Size:     dl.Size{Width: 560, Height: 650},
+		MinSize:  dl.Size{Width: 480, Height: 400},
+		Size:     dl.Size{Width: 680, Height: 820},
 		Layout:   dl.VBox{Spacing: 8},
 		Children: []dl.Widget{dl.ScrollView{Layout: dl.VBox{Spacing: 8}, Children: children}},
 	}).Create(mainWindow); err != nil {
@@ -641,6 +641,7 @@ func ShowResultWindowRemote(result *IngestResult) {
 		return
 	}
 	setTopMost(dlg.Handle())
+	makeDialogResizable(dlg)
 
 	// 进度条只认 0~100；没有置信度时停在 0，文案由 confidenceText 统一显示"暂无"
 	if confidencePB != nil && confidenceVal > 0 {

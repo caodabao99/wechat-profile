@@ -61,7 +61,7 @@ func showEditProfileDialog(id int64, onDone func()) {
 				label += "（每行 名称：描述；清空删除）"
 			}
 			var editor *walk.TextEdit
-			fields = append(fields, dl.Label{Text: label}, dl.TextEdit{AssignTo: &editor, Text: text, VScroll: true, MinSize: dl.Size{Width: 460, Height: 55}})
+			fields = append(fields, dl.Label{Text: label}, dl.TextEdit{AssignTo: &editor, Text: text, VScroll: true, MinSize: dl.Size{Height: 55}})
 			collect = append(collect, func() error {
 				s := strings.TrimSpace(editor.Text())
 				switch v.Kind() {
@@ -100,46 +100,50 @@ func showEditProfileDialog(id int64, onDone func()) {
 		}
 	}
 	addFields(reflect.ValueOf(&profile).Elem())
-	if err := (dl.Dialog{AssignTo: &dlg, Title: "编辑当前画像", Size: dl.Size{Width: 560, Height: 650}, Layout: dl.VBox{}, Children: []dl.Widget{
-		dl.Label{Text: "清空字段可删除信息；再次 AI 生成可能重新提取。"},
-		dl.ScrollView{Layout: dl.VBox{}, Children: fields},
-		dl.Composite{Layout: dl.HBox{}, Children: []dl.Widget{
-			dl.PushButton{AssignTo: &saveBtn, Text: "保存", OnClicked: func() {
-				for _, get := range collect {
-					if err := get(); err != nil {
-						showError(err.Error())
-						return
-					}
-				}
-				saving = true
-				saveBtn.SetEnabled(false)
-				cancelBtn.SetEnabled(false)
-				go func(p Profile) {
-					err := doEditProfile(id, p, contact.ProfileJSON)
-					mainWindow.Synchronize(func() {
-						if dlg.IsDisposed() {
-							return
-						}
-						saving = false
-						saveBtn.SetEnabled(true)
-						cancelBtn.SetEnabled(true)
-						if err != nil {
+	if err := (dl.Dialog{AssignTo: &dlg, Title: "编辑当前画像",
+		MinSize: dl.Size{Width: 480, Height: 360}, Size: dl.Size{Width: 720, Height: 820},
+		Layout: dl.VBox{Spacing: 6}, Children: []dl.Widget{
+			dl.Label{Text: "清空字段可删除信息；再次 AI 生成可能重新提取。"},
+			dl.ScrollView{Layout: dl.VBox{Spacing: 4}, Children: fields},
+			dl.Composite{Layout: dl.HBox{}, Children: []dl.Widget{
+				dl.PushButton{AssignTo: &saveBtn, Text: "保存", OnClicked: func() {
+					for _, get := range collect {
+						if err := get(); err != nil {
 							showError(err.Error())
 							return
 						}
-						dlg.Accept()
-						if onDone != nil {
-							onDone()
-						}
-					})
-				}(profile)
+					}
+					saving = true
+					saveBtn.SetEnabled(false)
+					cancelBtn.SetEnabled(false)
+					go func(p Profile) {
+						err := doEditProfile(id, p, contact.ProfileJSON)
+						mainWindow.Synchronize(func() {
+							if dlg.IsDisposed() {
+								return
+							}
+							saving = false
+							saveBtn.SetEnabled(true)
+							cancelBtn.SetEnabled(true)
+							if err != nil {
+								showError(err.Error())
+								return
+							}
+							dlg.Accept()
+							if onDone != nil {
+								onDone()
+							}
+						})
+					}(profile)
+				}},
+				dl.PushButton{AssignTo: &cancelBtn, Text: "取消", OnClicked: func() { dlg.Cancel() }},
 			}},
-			dl.PushButton{AssignTo: &cancelBtn, Text: "取消", OnClicked: func() { dlg.Cancel() }},
-		}},
-	}}).Create(mainWindow); err != nil {
+		}}).Create(mainWindow); err != nil {
 		showError(err.Error())
 		return
 	}
+	setTopMost(dlg.Handle())
+	makeDialogResizable(dlg)
 	dlg.Closing().Attach(func(canceled *bool, reason walk.CloseReason) {
 		if saving {
 			*canceled = true

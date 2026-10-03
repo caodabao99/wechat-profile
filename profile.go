@@ -420,10 +420,18 @@ func AnalyzeIntent(ctx context.Context, db *sql.DB, llmClient *LLMClient, contac
   "intent": "潜在意图，从[邀约/试探/求安慰/敷衍/婉拒/分享/日常寒暄/其他]中选择",
   "emotion": "情绪状态",
   "subtext": "潜台词",
-  "suggested_replies": ["建议回复1", "建议回复2", "建议回复3"],
+  "suggested_replies": [
+    {"style": "稳妥得体", "text": "该风格的回复"},
+    {"style": "简洁直接", "text": "该风格的回复"},
+    {"style": "亲切热情", "text": "该风格的回复"}
+  ],
   "confidence": 0.0
 }
-suggested_replies 请给出3条在沟通目的或回应策略上实质不同、自然可直接发送的回复供选择，例如共情回应、追问了解、提出行动建议；根据语境选择合适策略，不要只更换措辞，不要编造事实。
+suggested_replies 规则：
+1. style 只能从【稳妥得体、简洁直接、亲切热情、委婉留余地】四个名称中原样选择，不得自造名称。
+2. 四种风格的含义：稳妥得体=礼貌周全有分寸，不犯错的默认选择；简洁直接=最少字数一句话说清，不寒暄；亲切热情=有温度、表达关心、拉近距离；委婉留余地=不把话说死、给对方面子，适合拒绝或敏感话题。
+3. 结合当前语境，从四种里选出最合适的3种（不合语境的风格不要给，例如对方在求安慰时不要给简洁直接），按适合程度从高到低排列。
+4. 每条 text 都要真正体现对应风格，三条之间要有可感知的明显差异，而不是换几个字；不要编造事实，不要替用户做承诺。
 只输出 JSON，不要其他内容。`,
 		profileSummary, formatMessagesForPromptLimited(messages), strings.TrimSpace(newMessage))
 
@@ -439,41 +447,94 @@ suggested_replies 请给出3条在沟通目的或回应策略上实质不同、�
 	if result == nil {
 		return nil, fmt.Errorf("意图分析结果为空")
 	}
-	replies := suggestedReplies(result)
+	replies := suggestedReplyItems(result)
 	result["suggested_replies"] = replies
 	result["suggested_reply"] = ""
 	if len(replies) > 0 {
-		result["suggested_reply"] = replies[0]
+		result["suggested_reply"] = replies[0].Text
 	}
 	return result, nil
 }
 
-func suggestedReplies(result map[string]interface{}) []string {
-	out := []string{}
+// SuggestedReply 带风格标签的候选回复。
+type SuggestedReply struct {
+	Style string `json:"style"`
+	Text  string `json:"text"`
+}
+
+// suggestedReplyItems 解析模型输出的候选回复并规范化风格。
+// 兼容三种历史/异常形态：对象数组 [{style,text}]、纯字符串数组、单条 suggested_reply。
+func suggestedReplyItems(result map[string]interface{}) []SuggestedReply {
+	out := []SuggestedReply{}
 	seen := map[string]bool{}
-	add := func(s string) {
-		s = strings.TrimSpace(s)
-		if s != "" && !seen[s] && len(out) < 3 {
-			seen[s] = true
-			out = append(out, s)
+	usedStyle := map[string]bool{}
+	add := func(style, text string) {
+		text = strings.TrimSpace(text)
+		if text == "" || seen[text] || len(out) >= 3 {
+			return
 		}
+		style = normalizeStyle(strings.TrimSpace(style))
+		// 同一风格只保留一条；模型给重了就按固定顺序补一个没用过的风格
+		if usedStyle[style] {
+			for _, s := range replyStyles {
+				if !usedStyle[s] {
+					style = s
+					break
+				}
+			}
+		}
+		if usedStyle[style] {
+			return
+		}
+		seen[text] = true
+		usedStyle[style] = true
+		out = append(out, SuggestedReply{Style: style, Text: text})
 	}
 	switch values := result["suggested_replies"].(type) {
-	case []string:
-		for _, s := range values {
-			add(s)
+	case []SuggestedReply:
+		for _, r := range values {
+			add(r.Style, r.Text)
 		}
 	case []interface{}:
 		for _, v := range values {
-			if s, ok := v.(string); ok {
-				add(s)
+			switch t := v.(type) {
+			case map[string]interface{}:
+				style, _ := t["style"].(string)
+				text, _ := t["text"].(string)
+				if strings.TrimSpace(text) == "" {
+					text, _ = t["reply"].(string) // 容错个别模型用 reply 字段
+				}
+				add(style, text)
+			case string:
+				// 旧版纯字符串数组：按去重后的输出位置赋予固定风格（不能用原始索引 i，跳过后会错位）
+				add(replyStyleAt(len(out)), t)
 			}
+		}
+	case []string:
+		for _, s := range values {
+			add(replyStyleAt(len(out)), s)
 		}
 	}
 	if len(out) == 0 {
 		if s, ok := result["suggested_reply"].(string); ok {
-			add(s)
+			add(replyStyleAt(0), s)
 		}
+	}
+	return out
+}
+
+func replyStyleAt(i int) string {
+	if i >= 0 && i < len(replyStyles) {
+		return replyStyles[i]
+	}
+	return replyStyles[0]
+}
+
+func suggestedReplies(result map[string]interface{}) []string {
+	items := suggestedReplyItems(result)
+	out := make([]string, 0, len(items))
+	for _, r := range items {
+		out = append(out, r.Text)
 	}
 	return out
 }

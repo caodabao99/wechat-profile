@@ -37,6 +37,43 @@ func setTopMost(hwnd win.HWND) {
 		win.SWP_NOMOVE|win.SWP_NOSIZE|win.SWP_NOACTIVATE)
 }
 
+// spiGetWorkArea 对应 Win32 的 SPI_GETWORKAREA（lxn/win 未导出该常量）
+const spiGetWorkArea = 0x0030
+
+// makeDialogResizable 让固定大小的 walk 对话框支持拖拽边框缩放和最大化，
+// 并把初始尺寸钳制在屏幕工作区内、重新居中。
+// 编辑画像/画像变化/意图分析这类弹窗固定 680~820px 高，在 1366×768 的笔记本
+// 或开启 125%/150% DPI 缩放的屏幕上会超出屏幕，底部的保存/刷新按钮被切掉点不到；
+// 开启缩放后用户可以把窗口拉到舒服的尺寸，内部 ScrollView/TextEdit 会自动重排。
+func makeDialogResizable(dlg *walk.Dialog) {
+	hwnd := dlg.Handle()
+	style := win.GetWindowLong(hwnd, win.GWL_STYLE)
+	win.SetWindowLong(hwnd, win.GWL_STYLE, style|win.WS_THICKFRAME|win.WS_MAXIMIZEBOX)
+	win.SetWindowPos(hwnd, 0, 0, 0, 0, 0,
+		win.SWP_NOMOVE|win.SWP_NOSIZE|win.SWP_NOZORDER|win.SWP_NOACTIVATE|win.SWP_FRAMECHANGED)
+
+	// 工作区（排除任务栏），物理像素
+	var rc win.RECT
+	win.SystemParametersInfo(spiGetWorkArea, 0, unsafe.Pointer(&rc), 0)
+	const margin = 40 // 与屏幕边缘留出的余量，避免宽高正好等于工作区时贴边
+	maxW := int(rc.Right-rc.Left) - margin
+	maxH := int(rc.Bottom-rc.Top) - margin
+	// 顶层对话框的 BoundsPixels 即屏幕坐标物理像素
+	b := dlg.BoundsPixels()
+	w, h := b.Width, b.Height
+	if w > maxW {
+		w = maxW
+	}
+	if h > maxH {
+		h = maxH
+	}
+	if w != b.Width || h != b.Height || b.X < int(rc.Left) || b.Y < int(rc.Top) {
+		x := int(rc.Left) + (int(rc.Right-rc.Left)-w)/2
+		y := int(rc.Top) + (int(rc.Bottom-rc.Top)-h)/2
+		_ = dlg.SetBoundsPixels(walk.Rectangle{X: x, Y: y, Width: w, Height: h})
+	}
+}
+
 func appendPopupItem(hMenu win.HMENU, id uintptr, text string) {
 	ptr, _ := syscall.UTF16PtrFromString(text)
 	procAppendMenuW.Call(uintptr(hMenu), 0x0, id, uintptr(unsafe.Pointer(ptr)))
@@ -419,7 +456,7 @@ func ShowResultWindow(contactID int64, contactName string, newCount int, viaAlia
 						ReadOnly: true,
 						VScroll:  true,
 						Text:     analysisErr.Error(),
-						MinSize:  dl.Size{Width: 480, Height: 200},
+						MinSize:  dl.Size{Width: 600, Height: 200},
 					},
 				},
 			},
@@ -435,10 +472,10 @@ func ShowResultWindow(contactID int64, contactName string, newCount int, viaAlia
 			{"情绪状态", "emotion"},
 			{"潜台词", "subtext"},
 		}
-		for i, reply := range suggestedReplies(result) {
+		for i, reply := range suggestedReplyItems(result) {
 			key := fmt.Sprintf("suggested_reply_%d", i)
-			result[key] = reply
-			cardKeys = append(cardKeys, struct{ title, key string }{fmt.Sprintf("建议回复 %d", i+1), key})
+			result[key] = reply.Text
+			cardKeys = append(cardKeys, struct{ title, key string }{reply.Style, key})
 		}
 
 		for _, c := range cardKeys {
@@ -459,7 +496,7 @@ func ShowResultWindow(contactID int64, contactName string, newCount int, viaAlia
 										ReadOnly: true,
 										VScroll:  true,
 										Text:     content,
-										MinSize:  dl.Size{Width: 380, Height: 60},
+										MinSize:  dl.Size{Width: 500, Height: 64},
 									},
 									dl.PushButton{
 										Text:    "复制",
@@ -485,7 +522,7 @@ func ShowResultWindow(contactID int64, contactName string, newCount int, viaAlia
 								ReadOnly: true,
 								VScroll:  true,
 								Text:     content,
-								MinSize:  dl.Size{Width: 480, Height: 50},
+								MinSize:  dl.Size{Width: 600, Height: 54},
 							},
 						},
 					},
@@ -536,8 +573,8 @@ func ShowResultWindow(contactID int64, contactName string, newCount int, viaAlia
 	if err := (dl.Dialog{
 		AssignTo: &dlg,
 		Title:    "意图分析结果",
-		MinSize:  dl.Size{Width: 520, Height: 480},
-		Size:     dl.Size{Width: 560, Height: 650},
+		MinSize:  dl.Size{Width: 480, Height: 400},
+		Size:     dl.Size{Width: 680, Height: 820},
 		Layout:   dl.VBox{Spacing: 8},
 		Children: []dl.Widget{dl.ScrollView{Layout: dl.VBox{Spacing: 8}, Children: children}},
 	}).Create(mainWindow); err != nil {
@@ -545,6 +582,7 @@ func ShowResultWindow(contactID int64, contactName string, newCount int, viaAlia
 		return
 	}
 	setTopMost(dlg.Handle())
+	makeDialogResizable(dlg)
 
 	// 进度条只认 0~100；没有置信度时停在 0，文案由 confidenceText 统一显示"暂无"
 	if confidencePB != nil {
@@ -1201,8 +1239,9 @@ func ShowProfileWindow(targetContactID int64) {
 											dl.VSplitter{
 												Children: []dl.Widget{
 													dl.TableView{
-														AssignTo: &messagesTV,
-														Model:    mm,
+														AssignTo:      &messagesTV,
+														Model:         mm,
+														StretchFactor: 4,
 														Columns: []dl.TableViewColumn{
 															{Title: "发送方", Width: 50},
 															{Title: "内容", Width: 260},
@@ -1210,14 +1249,16 @@ func ShowProfileWindow(targetContactID int64) {
 														},
 													},
 													dl.GroupBox{
-														Title:  "完整内容",
-														Layout: dl.VBox{MarginsZero: true},
+														Title:         "完整内容（单条消息，需要时可拖动上方分隔线加高）",
+														StretchFactor: 1,
+														Layout:        dl.VBox{MarginsZero: true},
 														Children: []dl.Widget{
 															dl.TextEdit{
 																AssignTo: &msgDetailTE,
 																ReadOnly: true,
 																VScroll:  true,
 																Font:     fontBody,
+																MinSize:  dl.Size{Height: 76},
 															},
 														},
 													},
