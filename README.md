@@ -25,9 +25,9 @@
 
 ### 方式一：直接下载（推荐）
 
-去 [Releases](https://github.com/caodabao99/wechat-profile/releases) 页面下载最新版 `wechat-profile-v2.3.zip`，解压到任意目录。
+去 [Releases](https://github.com/caodabao99/wechat-profile/releases) 页面下载最新版 `wechat-profile-v2.3.1.zip`，解压到任意目录。
 
-> 同一个 Release 页面还附带服务端包 `wechat-profile-bot-v2.3.zip`（用「远程模式」时才需要），服务端的 Linux/Windows/Docker 部署说明见 [wechat-profile-bot](https://github.com/caodabao99/wechat-profile-bot)。
+> 同一个 Release 页面还附带服务端包 `wechat-profile-bot-v2.3.1.zip`（用「远程模式」时才需要），服务端的 Linux/Windows/Docker 部署说明见 [wechat-profile-bot](https://github.com/caodabao99/wechat-profile-bot)。
 
 ### 方式二：自行编译
 
@@ -44,7 +44,7 @@ rsrc -manifest app.manifest -o rsrc.syso
 go build -ldflags="-H windowsgui" -o wechat-profile.exe
 ```
 
-Linux/macOS 下交叉编译可直接执行 `./build.sh`，产物输出到 `dist/`。
+Linux/macOS 下交叉编译可直接执行 `./build.sh`，产物输出到 `dist/`。包内 `config.json` 由纳入版本库的 `config.example.json` 模板复制，不使用本机（gitignore 的）`config.json`，保证发布包始终包含全部最新配置项。
 
 ### 安装位置与开机自启（Windows）
 
@@ -216,6 +216,14 @@ Linux/macOS 下交叉编译可直接执行 `./build.sh`，产物输出到 `dist/
 4. 微信版本更新若导致复制格式变化，解析器内置降级逻辑（整段文本按对方消息处理），但消息时间与发言人识别可能失效，需按新版格式调整 `parser.go` 中的正则。
 
 ## 更新日志
+
+### v2.3.1（2026-10-03）
+
+体验修复，升级只需替换 exe（已按本版模板改过 config.json 的不用动配置）。
+
+- **编辑画像与画像查看格式完全对齐**：编辑弹窗按画像自身的 9 节结构展示（概要 / 基本信息 / 性格特征 / 沟通风格 / 兴趣爱好 / 情绪模式 / 关系 / 典型意图 / 重要事实），字段名与画像逐字一致（职业、所在地、口头禅、表情使用、压力源、安慰有效话题、近期共同事件等），回填顺序固定，删掉了此前自造的另一套字段名；典型意图按「名称 + 典型表现」逐行编辑
+- **候选回复固定给四种风格**：意图分析返回稳妥得体 / 简洁直接 / 亲切热情 / 委婉留余地各一条，风格由用户自己挑
+- **修复发布包 config.json 缺远程模式配置**：v2.3 安装包内的 config.json 没有 `remote` 段，导致想用远程模式时无处填写。本版起配置模板 `config.example.json` 纳入版本库，打包一律用它，发布包始终包含全部最新配置项。已在用 v2.3 的用户也可直接在 config.json 的 `myName` 后手动补 `remote` 段（enabled / apiURL / apiToken），不必重新下载
 
 ### v2.3（2026-10-03）
 

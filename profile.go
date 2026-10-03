@@ -423,15 +423,16 @@ func AnalyzeIntent(ctx context.Context, db *sql.DB, llmClient *LLMClient, contac
   "suggested_replies": [
     {"style": "稳妥得体", "text": "该风格的回复"},
     {"style": "简洁直接", "text": "该风格的回复"},
-    {"style": "亲切热情", "text": "该风格的回复"}
+    {"style": "亲切热情", "text": "该风格的回复"},
+    {"style": "委婉留余地", "text": "该风格的回复"}
   ],
   "confidence": 0.0
 }
 suggested_replies 规则：
-1. style 只能从【稳妥得体、简洁直接、亲切热情、委婉留余地】四个名称中原样选择，不得自造名称。
+1. style 只能从【稳妥得体、简洁直接、亲切热情、委婉留余地】四个名称中原样选择，不得自造名称，四种各给一条，一个都不能少，也不要重复。
 2. 四种风格的含义：稳妥得体=礼貌周全有分寸，不犯错的默认选择；简洁直接=最少字数一句话说清，不寒暄；亲切热情=有温度、表达关心、拉近距离；委婉留余地=不把话说死、给对方面子，适合拒绝或敏感话题。
-3. 结合当前语境，从四种里选出最合适的3种（不合语境的风格不要给，例如对方在求安慰时不要给简洁直接），按适合程度从高到低排列。
-4. 每条 text 都要真正体现对应风格，三条之间要有可感知的明显差异，而不是换几个字；不要编造事实，不要替用户做承诺。
+3. 固定按【稳妥得体、简洁直接、亲切热情、委婉留余地】的顺序输出。即使某种风格在当前语境下不是最优，也要写出该风格下最得体、不违和的版本（例如对方求安慰时，简洁直接也要简短而不失温度）。
+4. 每条 text 都要真正体现对应风格，四条之间要有可感知的明显差异，而不是换几个字；不要编造事实，不要替用户做承诺。
 只输出 JSON，不要其他内容。`,
 		profileSummary, formatMessagesForPromptLimited(messages), strings.TrimSpace(newMessage))
 
@@ -470,7 +471,8 @@ func suggestedReplyItems(result map[string]interface{}) []SuggestedReply {
 	usedStyle := map[string]bool{}
 	add := func(style, text string) {
 		text = strings.TrimSpace(text)
-		if text == "" || seen[text] || len(out) >= 3 {
+		// 四种风格各一条，最多 4 条
+		if text == "" || seen[text] || len(out) >= len(replyStyles) {
 			return
 		}
 		style = normalizeStyle(strings.TrimSpace(style))
