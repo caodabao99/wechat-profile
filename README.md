@@ -25,9 +25,9 @@
 
 ### 方式一：直接下载（推荐）
 
-去 [Releases](https://github.com/caodabao99/wechat-profile/releases) 页面下载最新版 `wechat-profile-v2.3.3.zip`，解压到任意目录。
+去 [Releases](https://github.com/caodabao99/wechat-profile/releases) 页面下载最新版 `wechat-profile-v3.0.0.zip`，解压到任意目录。
 
-> 同一个 Release 页面还附带服务端包 `wechat-profile-bot-v2.3.3.zip` 和 Docker 镜像 `wechat-profile-bot-docker-v2.3.3.tar.gz`（用「远程模式」时才需要），服务端的 Linux/Windows/Docker 部署说明见 [wechat-profile-bot](https://github.com/caodabao99/wechat-profile-bot)。
+> 需要远程模式（桌面端连 bot 服务端）时，服务端包 `wechat-profile-bot-v4.0.0.zip` 与 Docker 镜像 `wechat-profile-bot-docker-v4.0.0.tar.gz` 在 [wechat-profile-bot](https://github.com/caodabao99/wechat-profile-bot) 的 Releases；服务端的 Linux/Windows/Docker 部署说明也在那里。
 
 ### 方式二：自行编译
 
@@ -216,6 +216,16 @@ Linux/macOS 下交叉编译可直接执行 `./build.sh`，产物输出到 `dist/
 4. 微信版本更新若导致复制格式变化，解析器内置降级逻辑（整段文本按对方消息处理），但消息时间与发言人识别可能失效，需按新版格式调整 `parser.go` 中的正则。
 
 ## 更新日志
+
+### v3.0.0（2026-10-04）
+
+功能定位收敛的大版本：桌面端专注「贴着微信 PC 的实时画像/意图分析 + 本地录入与编辑」，把备份、归档、批量导出等运维操作统一交给网页端。数据库结构无破坏，本地库可直接沿用。
+
+- **移除桌面端的备份导出/恢复界面**：备份与归档改由网页端统一管理，功能更完整、跨端一致（这是本版标为 3.0.0 的主要原因）
+- 意图分析、画像编辑、本地 SQLite 存储、以及“远程模式”连接 bot 服务端的体验保持不变
+- 与后端共享的解析/合并/存储层若干修正一并带入
+
+> 若你此前依赖桌面端做备份，请改用网页端「备份 / 归档」页；升级 exe 后本地已有数据不受影响。
 
 ### v2.3.4（2026-10-03）
 

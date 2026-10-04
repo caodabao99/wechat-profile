@@ -44,7 +44,10 @@ type ContactStats struct {
 
 // InitDB 打开（不存在则创建）SQLite 数据库并建表
 func InitDB(path string) (*sql.DB, error) {
-	dsn := path + "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)"
+	// WAL 下 synchronous=NORMAL 既安全又显著降低写盘放大；temp_store=MEMORY、
+	// cache_size(-8000≈8MB) 属保守调优，不会在低内存机器上造成问题。
+	dsn := path + "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)" +
+		"&_pragma=synchronous(NORMAL)&_pragma=temp_store(MEMORY)&_pragma=cache_size(-8000)"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
@@ -268,6 +271,69 @@ func migrate(db *sql.DB) error {
 			return err
 		}
 	}
+	if version < 7 {
+		// v7: 数据库性能升级（与服务端 wechat-profile-bot v8 对齐）。为 messages 新增
+		// msg_unix（Unix 秒）并建立覆盖“按联系人 + 时间/分页”的复合索引；旧数据分批回填。
+		// 桌面本地库无归档表，故只处理 messages。
+		// 幂等：列存在则跳过 ALTER；回填只补 msg_unix IS NULL 的行；任一步失败都在
+		// PRAGMA user_version=7 之前返回，下次启动整体重跑。
+		var colCount int
+		if err := db.QueryRow(
+			`SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name='msg_unix'`).
+			Scan(&colCount); err != nil {
+			return err
+		}
+		if colCount == 0 {
+			if _, err := db.Exec(`ALTER TABLE messages ADD COLUMN msg_unix INTEGER`); err != nil {
+				return err
+			}
+		}
+		if err := backfillMsgUnix(db); err != nil {
+			return err
+		}
+		for _, idx := range []string{
+			`CREATE INDEX IF NOT EXISTS idx_messages_contact_id ON messages(contact_id, id DESC)`,
+			`CREATE INDEX IF NOT EXISTS idx_messages_contact_unix ON messages(contact_id, msg_unix DESC, id DESC)`,
+		} {
+			if _, err := db.Exec(idx); err != nil {
+				return err
+			}
+		}
+		if _, err := db.Exec(`PRAGMA user_version = 7`); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// backfillMsgUnix 分批把 msg_time 换算成 Unix 秒写入 msg_unix（仅补 NULL 行）。
+// 按 id 窗口分批自动提交，避免百万级数据落入一个超长事务；首尾打印进度日志。
+func backfillMsgUnix(db *sql.DB) error {
+	var minID, maxID sql.NullInt64
+	if err := db.QueryRow(`SELECT MIN(id), MAX(id) FROM messages`).Scan(&minID, &maxID); err != nil {
+		return err
+	}
+	if !maxID.Valid {
+		return nil // 空表
+	}
+	const batch = int64(20000)
+	start, end := minID.Int64, maxID.Int64
+	var total int64
+	slog.Info("msg_unix 回填开始", "table", "messages", "minID", start, "maxID", end)
+	for lo := start; lo <= end; lo += batch {
+		hi := lo + batch - 1
+		res, err := db.Exec(
+			`UPDATE messages SET msg_unix = CAST(strftime('%s', msg_time) AS INTEGER)
+			 WHERE id >= ? AND id <= ? AND msg_unix IS NULL
+			   AND msg_time IS NOT NULL AND msg_time != ''`, lo, hi)
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n > 0 {
+			total += n
+		}
+	}
+	slog.Info("msg_unix 回填完成", "table", "messages", "updated", total)
 	return nil
 }
 
@@ -298,7 +364,16 @@ func SaveMessages(db *sql.DB, contactID int64, messages []Message) (int, error) 
 	dbMu.Lock()
 	defer dbMu.Unlock()
 
+	// 整批一个事务提交（过去每条一次隐式提交，粘贴一大片时写盘放大严重）；
+	// other_msg_count 累加后末尾写一次。整批原子：中途出错一律回滚，不留“半批已入库”。
+	tx, err := db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+
 	newCount := 0
+	newOther := 0
 	for _, m := range messages {
 		content := strings.TrimSpace(m.Content)
 		if content == "" {
@@ -309,24 +384,29 @@ func SaveMessages(db *sql.DB, contactID int64, messages []Message) (int, error) 
 			ts = time.Now()
 		}
 
-		res, err := db.Exec(
-			`INSERT OR IGNORE INTO messages (contact_id, sender, content, msg_hash, msg_time)
-			 VALUES (?, ?, ?, ?, ?)`,
-			contactID, m.Sender, content, messageHash(m, ts), ts.Format(time.RFC3339))
+		res, err := tx.Exec(
+			`INSERT OR IGNORE INTO messages (contact_id, sender, content, msg_hash, msg_time, msg_unix)
+			 VALUES (?, ?, ?, ?, ?, ?)`,
+			contactID, m.Sender, content, messageHash(m, ts), ts.Format(time.RFC3339), ts.Unix())
 		if err != nil {
-			return newCount, err
+			return 0, err
 		}
-		affected, _ := res.RowsAffected()
-		if affected > 0 {
+		if affected, _ := res.RowsAffected(); affected > 0 {
 			newCount++
 			if m.Sender == "other" {
-				if _, err := db.Exec(
-					`UPDATE contacts SET other_msg_count = other_msg_count + 1 WHERE id = ?`,
-					contactID); err != nil {
-					return newCount, err
-				}
+				newOther++
 			}
 		}
+	}
+	if newOther > 0 {
+		if _, err := tx.Exec(
+			`UPDATE contacts SET other_msg_count = other_msg_count + ? WHERE id = ?`,
+			newOther, contactID); err != nil {
+			return 0, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
 	}
 	return newCount, nil
 }

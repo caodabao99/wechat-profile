@@ -39,7 +39,7 @@ const (
 	backupFormatVersion = 1
 	backupDBEntry       = "data.db"
 	backupManifestName  = "MANIFEST.json"
-	backupCurrentDBVer  = 6 // 当前程序支持的最高 SQLite user_version
+	backupCurrentDBVer  = 7 // 当前程序支持的最高 SQLite user_version
 	backupMaxUnzipBytes = int64(512 << 20)
 	backupMaxEntries    = 20
 )
@@ -631,6 +631,15 @@ func RestoreBackupZipWithPassword(db *sql.DB, zipPath, sidecarDir string, makeSa
 	}
 	committed = true
 	profileEpoch++
+
+	// 恢复的旧备份（v≤6）没有 msg_unix，按同名列拷贝会跳过它，导致恢复行的 msg_unix 为空。
+	// 提交后就地补算。必须走当前持有的 conn（连接池仅 1 条），否则会等连接而自锁。
+	if _, err := conn.ExecContext(ctx,
+		`UPDATE messages SET msg_unix = CAST(strftime('%s', msg_time) AS INTEGER)
+		 WHERE msg_unix IS NULL AND msg_time IS NOT NULL AND msg_time != ''`); err != nil {
+		// 补算失败不能让整个恢复失败（数据已提交），只告警，下次启动 migrate 会重跑。
+		slog.Warn("恢复后补算 msg_unix 失败", "err", err)
+	}
 
 	summary.Contacts = counts["contacts"]
 	summary.Aliases = counts["contact_aliases"]

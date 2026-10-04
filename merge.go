@@ -396,7 +396,7 @@ func UndoMerge(db *sql.DB, mergeLogID int64) error {
 		return fmt.Errorf("解析重复消息快照失败: %w", err)
 	}
 	for _, m := range deleted {
-		if _, err := tx.Exec(`INSERT INTO messages (id, contact_id, sender, content, msg_hash, msg_time, captured_at) VALUES (?,?,?,?,?,?,?)`, m.ID, log.SourceID, m.Sender, m.Content, m.Hash, m.Time, m.Captured); err != nil {
+		if _, err := tx.Exec(`INSERT INTO messages (id, contact_id, sender, content, msg_hash, msg_time, captured_at, msg_unix) VALUES (?,?,?,?,?,?,?, CAST(strftime('%s', ?) AS INTEGER))`, m.ID, log.SourceID, m.Sender, m.Content, m.Hash, m.Time, m.Captured, m.Time); err != nil {
 			return err
 		}
 	}
