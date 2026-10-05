@@ -237,7 +237,7 @@ func SetupFloatingWindow() error {
 	var identifyBtn, profileBtn *walk.PushButton
 	if err := (dl.MainWindow{
 		AssignTo: &mainWindow,
-		Title:    "画像助手",
+		Title:    "画像助手 " + appVersion,
 		// 浮窗刻意做小：120×80（96dpi 逻辑尺寸，高 DPI 屏由 walk 自动放大）
 		Size:    dl.Size{Width: 120, Height: 80},
 		MinSize: dl.Size{Width: 120, Height: 80},
@@ -1067,6 +1067,14 @@ func ShowProfileWindow(targetContactID int64) {
 													})
 												},
 											},
+										},
+									},
+									dl.Composite{
+										Layout: dl.HBox{MarginsZero: true, Spacing: 4},
+										Children: []dl.Widget{
+											dl.PushButton{Text: "关系状态", MinSize: dl.Size{Width: 70, Height: 28}, OnClicked: func() { showRelationshipStateDialog(currentID) }},
+											dl.PushButton{Text: "重新认识TA", MinSize: dl.Size{Width: 82, Height: 28}, OnClicked: func() { showReplayDialog(currentID) }},
+											dl.PushButton{Text: "今天值得做", MinSize: dl.Size{Width: 82, Height: 28}, OnClicked: func() { showTodayDecisionsDialog() }},
 										},
 									},
 									dl.Composite{

@@ -253,6 +253,85 @@ func (c *RemoteClient) ProfileChanges(id int64) (ProfileChanges, error) {
 	return out, err
 }
 
+// ---- Personal Relationship OS 2.0：关系状态机 / Memory Replay / Decision Engine ----
+// 这三项是服务端能力（statemachine/decision/replay 只存在于 bot 仓），
+// 桌面端仅在远程模式下经此调用；本地模式下无对应实现，分发层会给出明确提示。
+
+// RelationshipStateJSON 对应服务端 statemachine.RelationshipStateView 的 JSON（字段名严格一致）。
+type RelationshipStateJSON struct {
+	ContactID    int64  `json:"contactId"`
+	Name         string `json:"name"`
+	BaseState    string `json:"baseState"`
+	DynamicState string `json:"dynamicState"`
+	Intimacy     int    `json:"intimacy"`
+	TrendState   string `json:"trendState"`
+	Alert        string `json:"alert"`
+	Health       int    `json:"health"`
+	Reason       string `json:"reason"`
+	ChangedAt    string `json:"changedAt"`
+	ComputedAt   string `json:"computedAt"`
+}
+
+// ContactState GET /api/contacts/{id}/state：关系状态机单联系人快照。
+// 服务端在尚无快照时返回 404，do() 会转成 error，调用方据此提示。
+func (c *RemoteClient) ContactState(id int64) (*RelationshipStateJSON, error) {
+	var out struct {
+		State RelationshipStateJSON `json:"state"`
+	}
+	if err := c.do("GET", fmt.Sprintf("/api/contacts/%d/state", id), nil, &out); err != nil {
+		return nil, err
+	}
+	return &out.State, nil
+}
+
+// ContactReplay GET /api/contacts/{id}/replay：Memory Replay「重新认识 TA」，
+// 服务端已用 RenderReplayText 渲染成纯文本，桌面端直接展示 rendered 字段。
+func (c *RemoteClient) ContactReplay(id int64) (string, error) {
+	var out struct {
+		OK       bool   `json:"ok"`
+		Rendered string `json:"rendered"`
+	}
+	if err := c.do("GET", fmt.Sprintf("/api/contacts/%d/replay", id), nil, &out); err != nil {
+		return "", err
+	}
+	return out.Rendered, nil
+}
+
+// DecisionCandidateJSON 对应服务端 decision.DecisionCandidate 的 JSON（snake_case tag 严格一致）。
+type DecisionCandidateJSON struct {
+	ContactID    int64    `json:"contact_id"`
+	Name         string   `json:"name"`
+	State        string   `json:"state"`
+	BaseState    string   `json:"base_state"`
+	DynamicState string   `json:"dynamic_state"`
+	Priority     int      `json:"priority"`
+	Risk         int      `json:"risk"`
+	Opportunity  int      `json:"opportunity"`
+	Intimacy     int      `json:"intimacy"`
+	Goal         string   `json:"goal,omitempty"`
+	Followup     string   `json:"followup,omitempty"`
+	Topic        string   `json:"topic,omitempty"`
+	Action       string   `json:"action,omitempty"`
+	BestTime     string   `json:"best_time,omitempty"`
+	Source       string   `json:"source"`
+	Confidence   string   `json:"confidence"`
+	ReasonCodes  []string `json:"reason_codes"`
+	WhyNow       []string `json:"why_now"`
+}
+
+// TodayDecisions GET /api/decision/today?top=N：今天最值得投入的关系行动 Top N（确定性排序，非 LLM）。
+func (c *RemoteClient) TodayDecisions(top int) ([]DecisionCandidateJSON, error) {
+	var out struct {
+		OK        bool                    `json:"ok"`
+		Count     int                     `json:"count"`
+		Decisions []DecisionCandidateJSON `json:"decisions"`
+	}
+	if err := c.do("GET", fmt.Sprintf("/api/decision/today?top=%d", top), nil, &out); err != nil {
+		return nil, err
+	}
+	return out.Decisions, nil
+}
+
 // ---- 合并 ----
 
 // MergeResultJSON 合并结果
