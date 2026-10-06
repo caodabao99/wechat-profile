@@ -16,8 +16,8 @@ import (
 // 明确提示而非静默失败。弹层范式完全沿用 ui_assistance.go：只读 TextEdit + 异步
 // fetch + mainWindow.Synchronize + setTopMost + makeDialogResizable。
 
-// os2RemoteOnlyHint 本地模式下的统一提示语。
-const os2RemoteOnlyHint = "此功能为服务端 Personal Relationship OS 2.0 能力，需在 config.json 中启用远程模式（remote.enabled=true 且填写 remote.apiURL）后使用。"
+// os2RemoteOnlyHint 本地模式下的统一提示语（蓝图 §23.2：功能要求服务端时必须明说，禁止静默失败）。
+const os2RemoteOnlyHint = "此功能需要连接 Relationship OS Server 才能使用（本地模式不提供）。\n请在 config.json 中启用远程模式：remote.enabled=true 且填写 remote.apiURL。"
 
 // 状态枚举中文映射（与服务端 statemachine.go 常量一致）。
 var (

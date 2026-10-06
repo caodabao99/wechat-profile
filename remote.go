@@ -363,6 +363,89 @@ func (c *RemoteClient) MemoryReview(limit int) ([]MemoryReviewItemJSON, error) {
 	return out.Items, nil
 }
 
+// ---- V7 §18 桌面核心入口：Contact Brief (§14) + Relationship Session (§7) ----
+
+// briefBeforeJSON 对应服务端 BeforeBrief（§7.1 事实全景）。只声明桌面渲染所需字段。
+type briefBeforeJSON struct {
+	RelationshipState string   `json:"relationship_state"`
+	Health            int      `json:"health"`
+	Change30d         string   `json:"change_30d"`
+	ImportantFacts    []string `json:"important_facts"`
+	ConflictFacts     []string `json:"conflict_facts"`
+	OpenItems         []string `json:"open_items"`
+	Goals             []string `json:"goals"`
+	Projects          []string `json:"projects"`
+	Risks             []string `json:"risks"`
+	Opportunities     []string `json:"opportunities"`
+	LastAction        string   `json:"last_action"`
+	LastActionAt      string   `json:"last_action_at"`
+}
+
+// strategyJSON 对应服务端 SessionStrategy（§7.2 推荐策略）。
+type strategyJSON struct {
+	Recommended       string   `json:"recommended"`
+	Backup            string   `json:"backup"`
+	Why               []string `json:"why"`
+	DataBasis         []string `json:"data_basis"`
+	Confidence        string   `json:"confidence"`
+	HistEffectiveness string   `json:"hist_effectiveness"`
+	Priority          int      `json:"priority"`
+	BestTime          string   `json:"best_time"`
+}
+
+// ContactBriefJSON 对应服务端 contact_brief.ContactBrief（§14 联系前简报）。
+type ContactBriefJSON struct {
+	ContactID    int64           `json:"contact_id"`
+	Name         string          `json:"name"`
+	Now          string          `json:"now"`
+	Layer        string          `json:"layer"`
+	Brief        briefBeforeJSON `json:"brief"`
+	Strategy     strategyJSON    `json:"strategy"`
+	RecentTopics []string        `json:"recent_topics"`
+	AvoidItems   []string        `json:"avoid_items"`
+}
+
+// RelationshipSessionJSON 对应服务端 relationship_session.RelationshipSession（§7）。
+// 只取桌面渲染所需字段（rehearsal 细节留给网页端）。
+type RelationshipSessionJSON struct {
+	ContactID       int64           `json:"contact_id"`
+	Name            string          `json:"name"`
+	Now             string          `json:"now"`
+	Brief           briefBeforeJSON `json:"before_brief"`
+	Strategy        strategyJSON    `json:"strategy"`
+	ObservationDays []int           `json:"observation_days"`
+}
+
+// ContactBrief GET /api/contacts/{id}/brief：联系前简报（服务端纯确定性，LLM 缺失也 200）。
+func (c *RemoteClient) ContactBrief(id int64) (*ContactBriefJSON, error) {
+	var out struct {
+		OK    bool              `json:"ok"`
+		Brief *ContactBriefJSON `json:"brief"`
+	}
+	if err := c.do("GET", fmt.Sprintf("/api/contacts/%d/brief", id), nil, &out); err != nil {
+		return nil, err
+	}
+	if out.Brief == nil {
+		return nil, fmt.Errorf("服务端未返回简报数据")
+	}
+	return out.Brief, nil
+}
+
+// RelationshipSession GET /api/contacts/{id}/session：一屏关系会话编排（§7，只读无副作用）。
+func (c *RemoteClient) RelationshipSession(id int64) (*RelationshipSessionJSON, error) {
+	var out struct {
+		OK      bool                     `json:"ok"`
+		Session *RelationshipSessionJSON `json:"session"`
+	}
+	if err := c.do("GET", fmt.Sprintf("/api/contacts/%d/session", id), nil, &out); err != nil {
+		return nil, err
+	}
+	if out.Session == nil {
+		return nil, fmt.Errorf("服务端未返回会话数据")
+	}
+	return out.Session, nil
+}
+
 // ---- 合并 ----
 
 // MergeResultJSON 合并结果

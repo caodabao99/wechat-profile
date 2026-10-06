@@ -355,6 +355,10 @@ func bindFloatingEvents() {
 		appendPopupItem(hMenu, 1, "查看画像")
 		appendPopupItem(hMenu, 2, "查看联系人")
 		appendPopupSeparator(hMenu)
+		// §23 Desktop v4.0 首页 + 全局核心入口（Memory Maintenance）
+		appendPopupItem(hMenu, 5, "首页 · Today Top 3")
+		appendPopupItem(hMenu, 6, "记忆维护 · Memory Maintenance")
+		appendPopupSeparator(hMenu)
 		appendPopupItem(hMenu, 3, "设置")
 		appendPopupItem(hMenu, 4, "退出")
 		win.SetForegroundWindow(mainWindow.Handle())
@@ -366,6 +370,10 @@ func bindFloatingEvents() {
 		switch cmd {
 		case 1, 2:
 			ShowProfileWindow(0)
+		case 5:
+			showTodayTop3Dialog()
+		case 6:
+			showMemoryReviewDialog()
 		case 3:
 			walk.MsgBox(mainWindow, "设置",
 				"请编辑程序同目录下的 config.json，填写 myName 与 llm.apiKey，\n保存后重新启动程序生效。\n\n注意：聊天内容会发送到配置的云端大模型接口，请注意隐私。",
@@ -1072,6 +1080,8 @@ func ShowProfileWindow(targetContactID int64) {
 									dl.Composite{
 										Layout: dl.HBox{MarginsZero: true, Spacing: 4},
 										Children: []dl.Widget{
+											dl.PushButton{Text: "联系前简报", MinSize: dl.Size{Width: 78, Height: 28}, OnClicked: func() { showContactBriefDialog(currentID) }},
+											dl.PushButton{Text: "关系会话", MinSize: dl.Size{Width: 70, Height: 28}, OnClicked: func() { showRelationshipSessionDialog(currentID) }},
 											dl.PushButton{Text: "关系状态", MinSize: dl.Size{Width: 70, Height: 28}, OnClicked: func() { showRelationshipStateDialog(currentID) }},
 											dl.PushButton{Text: "重新认识TA", MinSize: dl.Size{Width: 82, Height: 28}, OnClicked: func() { showReplayDialog(currentID) }},
 											dl.PushButton{Text: "今天值得做", MinSize: dl.Size{Width: 82, Height: 28}, OnClicked: func() { showTodayDecisionsDialog() }},
