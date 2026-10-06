@@ -332,6 +332,37 @@ func (c *RemoteClient) TodayDecisions(top int) ([]DecisionCandidateJSON, error) 
 	return out.Decisions, nil
 }
 
+// MemoryReviewItemJSON 对应服务端 memory_review.MemoryReviewItem 的 JSON（snake_case tag 严格一致）。
+type MemoryReviewItemJSON struct {
+	FactID           int64   `json:"fact_id"`
+	ContactID        int64   `json:"contact_id"`
+	ContactName      string  `json:"contact_name"`
+	FactType         string  `json:"fact_type"`
+	FactKey          string  `json:"fact_key"`
+	FactValue        string  `json:"fact_value"`
+	Status           string  `json:"status"`
+	Confidence       float64 `json:"confidence"`
+	EvidenceStrength float64 `json:"evidence_strength"`
+	HasConflict      bool    `json:"has_conflict"`
+	LastSeen         string  `json:"last_seen"`
+	LastConfirmedAt  string  `json:"last_confirmed_at"`
+	Reason           string  `json:"reason"`
+	Priority         int     `json:"priority"`
+}
+
+// MemoryReview GET /api/memory/review?limit=N：待确认记忆队列（系统识别但尚未被用户确认、或出现冲突需复核的事实）。
+func (c *RemoteClient) MemoryReview(limit int) ([]MemoryReviewItemJSON, error) {
+	var out struct {
+		OK    bool                   `json:"ok"`
+		Count int                    `json:"count"`
+		Items []MemoryReviewItemJSON `json:"items"`
+	}
+	if err := c.do("GET", fmt.Sprintf("/api/memory/review?limit=%d", limit), nil, &out); err != nil {
+		return nil, err
+	}
+	return out.Items, nil
+}
+
 // ---- 合并 ----
 
 // MergeResultJSON 合并结果

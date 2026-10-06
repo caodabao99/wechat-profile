@@ -171,6 +171,85 @@ func riskText(r int) string {
 	return "低"
 }
 
+// fetchMemoryReviewText 拉取并渲染「待确认记忆」队列为文本（全局，自动适配本地/远程）。
+func fetchMemoryReviewText(limit int) (string, error) {
+	if !isRemoteMode {
+		return "", fmt.Errorf("%s", os2RemoteOnlyHint)
+	}
+	list, err := remoteClient.MemoryReview(limit)
+	if err != nil {
+		return "", err
+	}
+	if len(list) == 0 {
+		return "没有需要确认的记忆，画像事实都很稳。", nil
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "待确认记忆（系统识别但尚未确认、或出现冲突需复核的事实，Top %d）\n", len(list))
+	for i, it := range list {
+		fmt.Fprintf(&b, "\n%d. %s", i+1, it.ContactName)
+		if it.ContactName == "" {
+			fmt.Fprintf(&b, "联系人#%d", it.ContactID)
+		}
+		fmt.Fprintf(&b, " · %s：%s", it.FactType, it.FactValue)
+		if it.HasConflict {
+			b.WriteString("　[⚠ 有冲突]")
+		}
+		if it.Reason != "" {
+			fmt.Fprintf(&b, "\n   为何需确认：%s", it.Reason)
+		}
+		if it.Status != "" {
+			fmt.Fprintf(&b, "\n   当前状态：%s", it.Status)
+		}
+		if it.Confidence > 0 {
+			fmt.Fprintf(&b, "\n   置信度：%.2f", it.Confidence)
+		}
+	}
+	fmt.Fprintf(&b, "\n\n说明：以上为服务端识别的记忆，确认前不作为既定事实；请到对应联系人页核对。")
+	return b.String(), nil
+}
+
+// showMemoryReviewDialog 待确认记忆弹层（只读 + 刷新 + 复制）。
+func showMemoryReviewDialog() {
+	var dlg *walk.Dialog
+	var output *walk.TextEdit
+	var refresh *walk.PushButton
+	load := func() {
+		refresh.SetEnabled(false)
+		go func() {
+			out, err := fetchMemoryReviewText(50)
+			mainWindow.Synchronize(func() {
+				if dlg.IsDisposed() {
+					return
+				}
+				refresh.SetEnabled(true)
+				if err != nil {
+					output.SetText(err.Error())
+					return
+				}
+				output.SetText(strings.ReplaceAll(out, "\n", "\r\n"))
+			})
+		}()
+	}
+	err := (dl.Dialog{AssignTo: &dlg, Title: "待确认记忆 · Memory Review",
+		MinSize: dl.Size{Width: 520, Height: 420}, Size: dl.Size{Width: 720, Height: 640},
+		Layout: dl.VBox{Spacing: 6}, Children: []dl.Widget{
+			dl.Label{Text: "服务端从对话中识别出、但尚未被确认或与现有事实冲突的记忆条目，逐条核对后才写为既定事实（只读）。"},
+			dl.TextEdit{AssignTo: &output, ReadOnly: true, VScroll: true, MinSize: dl.Size{Height: 420}},
+			dl.Composite{Layout: dl.HBox{MarginsZero: true, Spacing: 6}, Children: []dl.Widget{
+				dl.PushButton{AssignTo: &refresh, Text: "刷新队列", OnClicked: load},
+				dl.PushButton{Text: "复制", OnClicked: func() { _ = clipboard.WriteAll(output.Text()) }},
+			}},
+		}}).Create(mainWindow)
+	if err != nil {
+		showError(err.Error())
+		return
+	}
+	setTopMost(dlg.Handle())
+	makeDialogResizable(dlg)
+	load()
+	dlg.Run()
+}
+
 // showRelationshipStateDialog 关系状态快照弹层（只读 + 刷新 + 复制）。
 func showRelationshipStateDialog(id int64) {
 	if id <= 0 {

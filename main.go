@@ -17,7 +17,7 @@ var (
 
 // appVersion 桌面端版本单一事实来源。
 // 与 git tag 同步；package_release.sh 的 DESK_VER 默认取此处，避免多版本号。
-const appVersion = "v3.1.0"
+const appVersion = "v3.2.0"
 
 // dbPath 返回程序同目录下的数据库路径。
 //

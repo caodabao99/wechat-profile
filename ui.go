@@ -1075,6 +1075,7 @@ func ShowProfileWindow(targetContactID int64) {
 											dl.PushButton{Text: "关系状态", MinSize: dl.Size{Width: 70, Height: 28}, OnClicked: func() { showRelationshipStateDialog(currentID) }},
 											dl.PushButton{Text: "重新认识TA", MinSize: dl.Size{Width: 82, Height: 28}, OnClicked: func() { showReplayDialog(currentID) }},
 											dl.PushButton{Text: "今天值得做", MinSize: dl.Size{Width: 82, Height: 28}, OnClicked: func() { showTodayDecisionsDialog() }},
+											dl.PushButton{Text: "待确认记忆", MinSize: dl.Size{Width: 82, Height: 28}, OnClicked: func() { showMemoryReviewDialog() }},
 										},
 									},
 									dl.Composite{
