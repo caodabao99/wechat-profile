@@ -28,7 +28,7 @@
 
 去 [Releases](https://github.com/caodabao99/wechat-profile/releases) 页面下载最新版 `wechat-profile-v4.0.1.zip`，解压到任意目录。
 
-> 需要远程模式（桌面端连 bot 服务端）时，服务端包 `wechat-profile-bot-v7.3.3.zip` 与 Docker 镜像 `wechat-profile-bot-docker-v7.3.3.tar.gz` 在 [wechat-profile-bot](https://github.com/caodabao99/wechat-profile-bot) 的 Releases；服务端的 Linux/Windows/Docker 部署说明也在那里。
+> 需要远程模式（桌面端连 bot 服务端）时，服务端包 `wechat-profile-bot-v7.4.0.zip` 与 Docker 镜像 `wechat-profile-bot-docker-v7.4.0.tar.gz` 在 [wechat-profile-bot](https://github.com/caodabao99/wechat-profile-bot) 的 Releases；服务端的 Linux/Windows/Docker 部署说明也在那里。
 
 ### 方式二：自行编译
 
