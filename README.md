@@ -19,15 +19,16 @@
 - **画像历史**：每次画像更新（自动/手动/合并）都会保留历史版本和变化说明，可随时查看和对比
 - **本地存储**：所有数据保存在本地 SQLite，不上传任何服务器（仅识别时发送给配置的 LLM）
 - **远程模式（可选）**：可改为连接 `wechat-profile-bot` 服务端，数据与 LLM 分析都在服务端，界面操作完全一致
+- **v4.0.0 三个核心入口（仅远程模式）**：联系人详情工具栏新增**联系前简报**（服务端 `/api/contacts/{id}/brief`，纯确定性）、**关系会话**（`/session`，只读编排）、**记忆维护**（全局待确认队列，只读）；右击菜单另有**首页 Today Top 3**。本地模式会给明确提示而非静默失败
 - **窗口置顶**：悬浮窗、结果窗、画像窗均置顶显示，不被微信等程序遮挡
 
 ## 下载与安装
 
 ### 方式一：直接下载（推荐）
 
-去 [Releases](https://github.com/caodabao99/wechat-profile/releases) 页面下载最新版 `wechat-profile-v3.0.0.zip`，解压到任意目录。
+去 [Releases](https://github.com/caodabao99/wechat-profile/releases) 页面下载最新版 `wechat-profile-v4.0.0.zip`，解压到任意目录。
 
-> 需要远程模式（桌面端连 bot 服务端）时，服务端包 `wechat-profile-bot-v4.0.0.zip` 与 Docker 镜像 `wechat-profile-bot-docker-v4.0.0.tar.gz` 在 [wechat-profile-bot](https://github.com/caodabao99/wechat-profile-bot) 的 Releases；服务端的 Linux/Windows/Docker 部署说明也在那里。
+> 需要远程模式（桌面端连 bot 服务端）时，服务端包 `wechat-profile-bot-v7.1.1.zip` 与 Docker 镜像 `wechat-profile-bot-docker-v7.1.1.tar.gz` 在 [wechat-profile-bot](https://github.com/caodabao99/wechat-profile-bot) 的 Releases；服务端的 Linux/Windows/Docker 部署说明也在那里。
 
 ### 方式二：自行编译
 
@@ -179,15 +180,15 @@ Linux/macOS 下交叉编译可直接执行 `./build.sh`，产物输出到 `dist/
 
 `disableThinking` 默认 `true` 关闭推理思考模式（本程序不需要推理，开着只会变慢、多耗 token）。对于默认开启思考的模型（如 deepseek-v4-flash、qwen3.8-flash）必须保持 `true`；不支持的接口会自动忽略该参数。
 
-## 备份与恢复（换电脑迁移）
+## 备份与恢复（v3.0.0 起移交网页端）
 
-画像窗口左下角提供「备份…」「恢复…」按钮：
+**桌面端已移除「备份…」「恢复…」按钮**（这也是本版标为 3.0.0 的主要原因）：备份、归档、批量导出等运维操作统一由 `wechat-profile-bot` 的**网页管理端**承担，功能更完整、跨端一致。
 
-- **备份…**：选择保存位置后会弹出一个「设置备份密码」窗口（可留空），然后导出 `wechat-profile-backup-日期.zip`，包含全部联系人、消息、画像历史、合并记录和 `config.json`
-- **恢复…**：在新电脑装好程序后，选择旧电脑导出的 zip 即可整体恢复；恢复前会自动在程序目录留一份「恢复前自动备份」，恢复配置文件后重启程序生效
-- 远程模式下这两个按钮自动操作的是 bot 服务端数据（同时包含服务端配置与凭据），换服务器时同样适用
+- 本地模式：直接备份程序目录的 `wechat_profile.db`（SQLite 单文件）即可迁移。
+- 远程模式：在网页端「备份」页导出/恢复 bot 服务端数据（含服务端配置与凭据），换服务器同样适用。
+- 下文加密语义描述的是**服务端网页端**的备份行为，桌面端不再提供入口。
 
-### 备份密码（可选加密）
+### 备份密码（网页端可选加密）
 
 导出时填了密码，zip 里的**密钥文件**就会被加密：
 
@@ -216,6 +217,24 @@ Linux/macOS 下交叉编译可直接执行 `./build.sh`，产物输出到 `dist/
 4. 微信版本更新若导致复制格式变化，解析器内置降级逻辑（整段文本按对方消息处理），但消息时间与发言人识别可能失效，需按新版格式调整 `parser.go` 中的正则。
 
 ## 更新日志
+
+### v4.0.0（2026-10-06）— Personal Relationship OS 3.0 集成
+
+配合服务端 v7.0.0/v7.1.x，将三项服务端能力接入桌面原生界面（仅远程模式，只读弹层）：
+
+- **联系前简报 Contact Brief**（`GET /api/contacts/{id}/brief`）：联系 TA 前一屏看清关系状态 / 近 30 天变化 / 重要与冲突事实 / 未完成 / 风险机会 / 推荐策略。
+- **关系会话 Relationship Session**（`GET /api/contacts/{id}/session`）：事实全景 + 策略 + 长期观察计划的只读编排（对话预演仍去网页端）。
+- **记忆维护 Memory Maintenance**：全局待确认记忆队列（只读；确认/驳回请在网页端操作）。
+- **首页 Today Top 3**：右击菜单入口，服务端确定性排序（非 LLM）取前 3。
+- 本地模式对需服务端的功能统一给出「此功能需要连接 Relationship OS Server」明确提示，不再静默失败。
+
+### v3.2.0（2026-10-06）
+
+- 新增第三个轻量入口 **Memory Review**（全局待确认记忆队列，只读弹层）。
+
+### v3.1.0（2026-10-06）
+
+- 接入服务端 **Personal Relationship OS 2.0** 三项派生能力（远程模式）：关系状态 `GET /api/contacts/{id}/state`、重新认识TA `/replay`、今天值得做 `GET /api/decision/today`（确定性打分，非 LLM 排序）。
 
 ### v3.0.0（2026-10-04）
 
