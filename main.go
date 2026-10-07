@@ -33,6 +33,10 @@ func dbPath() string {
 }
 
 func main() {
+	// -1. 单实例保护：必须是进程里的第一件事，早于建日志、开数据库、注册托盘图标，
+	//     这样被拦下的第二个进程不会留下任何副作用（详见 singleinstance_windows.go）。
+	ensureSingleInstance()
+
 	// 0. 日志（GUI 程序没有控制台，wechat-profile.log 是排查问题的唯一途径）
 	logFile := setupLogging()
 	if logFile != nil {
