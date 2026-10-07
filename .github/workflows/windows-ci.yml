@@ -1,0 +1,38 @@
+name: Windows CI
+
+# 桌面端依赖 Windows-only 的 lxn/walk，只能在 windows runner 上真正编译与测试。
+# 目的：让「迁移链 v1→v7」「解析器」这些测试每次 push 都真跑一遍，而不是靠人肉在 Windows 上试。
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: windows-latest
+    env:
+      CGO_ENABLED: "0" # 纯 Go SQLite（glebarez），不需要 gcc，也与发布构建一致
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt 检查
+        shell: pwsh
+        run: |
+          $bad = gofmt -l .
+          if ($bad) {
+            Write-Host "以下文件未通过 gofmt：`n$bad"
+            exit 1
+          }
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go build
+        run: go build ./...
+
+      - name: go test（含 v1→v7 迁移链）
+        run: go test -v ./...

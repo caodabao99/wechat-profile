@@ -26,9 +26,9 @@
 
 ### 方式一：直接下载（推荐）
 
-去 [Releases](https://github.com/caodabao99/wechat-profile/releases) 页面下载最新版 `wechat-profile-v4.0.0.zip`，解压到任意目录。
+去 [Releases](https://github.com/caodabao99/wechat-profile/releases) 页面下载最新版 `wechat-profile-v4.0.1.zip`，解压到任意目录。
 
-> 需要远程模式（桌面端连 bot 服务端）时，服务端包 `wechat-profile-bot-v7.1.1.zip` 与 Docker 镜像 `wechat-profile-bot-docker-v7.1.1.tar.gz` 在 [wechat-profile-bot](https://github.com/caodabao99/wechat-profile-bot) 的 Releases；服务端的 Linux/Windows/Docker 部署说明也在那里。
+> 需要远程模式（桌面端连 bot 服务端）时，服务端包 `wechat-profile-bot-v7.2.0.zip` 与 Docker 镜像 `wechat-profile-bot-docker-v7.2.0.tar.gz` 在 [wechat-profile-bot](https://github.com/caodabao99/wechat-profile-bot) 的 Releases；服务端的 Linux/Windows/Docker 部署说明也在那里。
 
 ### 方式二：自行编译
 
@@ -218,6 +218,13 @@ Linux/macOS 下交叉编译可直接执行 `./build.sh`，产物输出到 `dist/
 5. **只允许一个实例运行**：重复双击启动会弹提示并自动退出（同时尽量把已运行窗口的带到前台）。因为两个进程会同时监听剪贴板，导致同一条记录被重复识别、重复消耗大模型额度，并可能并发写同一个数据库。若提示“已在运行”但托盘里看不到图标，先在任务管理器里结束旧的 `wechat-profile.exe` 再启动。
 
 ## 更新日志
+
+### v4.0.1（2026-10-07）— 单实例保护 + v1→v7 迁移链回归 + Windows CI
+
+- **单实例互斥**：重复启动会提示并自动退出（并尽量把已运行窗口带到前台）。此前无任何保护，两个进程会同时监听剪贴板 → 同一条记录被重复识别、重复消耗大模型额度，并可能并发写同一个数据库。
+- **v1→v7 整条迁移链测试**：此前只覆盖最后一步（v6→v7）。现在把库依次降回 v1~v6 再迁移，逐步校验「收敛到最新版本 + 幂等 + 联系人数据不丢」，老库升级不再有未验证路径。
+- **新增 Windows CI**（`.github/workflows/windows-ci.yml`）：每次 push/PR 在 windows runner 上跑 gofmt / go vet / go build / go test，桌面端不再是零 CI。
+- 服务端配套：bot **v7.2.0**（网页端已接入指挥中心 / 策略学习 / 个性化校准）。
 
 ### v4.0.0（2026-10-06）— Personal Relationship OS 3.0 集成
 
