@@ -1,0 +1,32 @@
+# 统一行尾：仓库内一律 LF，避免 Windows 上 checkout 成 CRLF 后
+# gofmt/go vet 把每个 .go 文件都判为「未格式化」（Windows CI 首次运行正是这样全红的）。
+* text=auto eol=lf
+
+*.go        text eol=lf
+*.md        text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+*.json      text eol=lf
+*.txt       text eol=lf
+*.js        text eol=lf
+*.css       text eol=lf
+*.html      text eol=lf
+*.manifest  text eol=lf
+*.mod       text eol=lf
+*.sum       text eol=lf
+
+# Windows 批处理必须 CRLF，否则 cmd.exe 可能解析异常
+*.bat       text eol=crlf
+*.cmd       text eol=crlf
+*.ps1       text eol=crlf
+
+# 二进制不做行尾转换
+*.png       binary
+*.jpg       binary
+*.ico       binary
+*.syso      binary
+*.zip       binary
+*.gz        binary
+*.tar       binary
+*.exe       binary
+*.db        binary
